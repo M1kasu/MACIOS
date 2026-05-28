@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C d:/Agent-Hub log --oneline -20)",
+      "Bash(awk -F/ '{for\\(i=1;i<NF;i++\\){printf \"|  \"}print \"|-- \"$NF}')",
+      "Bash(xargs wc -l)"
+    ]
+  }
+}
