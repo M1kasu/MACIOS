@@ -372,7 +372,7 @@
     <div class="card">
       <h3>任务列表</h3>
       <div class="toolbar">
-        <button class="tiny ghost" type="button" onclick="loadTasks()">刷新</button>
+        <button class="tiny ghost" type="button" onclick="loadTasks({force:true})">刷新</button>
         <input id="actor" placeholder="操作者 ID" value="dashboard-user" />
       </div>
       <div class="task-list" id="tasks">
@@ -396,6 +396,11 @@ let selectedTaskId = null;
 let evtSource = null;
 let lastLiveAt = 0;
 let liveTimer = null;
+const TASK_LIST_POLL_MS = 15000;
+const TASK_LIST_MIN_RELOAD_MS = 10000;
+let _tasksInFlight = null;
+let _tasksReloadTimer = null;
+let _lastTasksLoadAt = 0;
 
 // ── 文案映射 ─────────────────────────────────────
 const TASK_STATUS = {
@@ -552,38 +557,62 @@ function setLive(on) {
 }
 
 // ── 任务列表 ─────────────────────────────────────
-async function loadTasks() {
-  let rows;
-  try {
-    rows = await fetch(`${API}/tasks?limit=50`).then(r => r.json());
-  } catch (e) {
-    document.getElementById('tasks').innerHTML =
-      `<div class="empty">无法加载任务列表：${escapeHtml(e.message || e)}</div>`;
-    return;
+async function loadTasks(options = {}) {
+  const force = options.force === true;
+  if (_tasksInFlight) return _tasksInFlight;
+
+  const now = Date.now();
+  const waitMs = TASK_LIST_MIN_RELOAD_MS - (now - _lastTasksLoadAt);
+  if (!force && waitMs > 0) {
+    scheduleTasksReload(waitMs);
+    return Promise.resolve();
   }
-  const el = document.getElementById('tasks');
-  if (!rows || !rows.length) {
-    el.innerHTML = '<div class="empty">暂无任务，先在飞书或 API 发起一个吧。</div>';
-    return;
-  }
-  el.innerHTML = rows.map(r => `
-    <div class="task ${r.task_id === selectedTaskId ? 'selected' : ''}"
-         onclick="selectTask('${escapeHtml(r.task_id)}')">
-      <div class="title">${escapeHtml(r.title || r.task_id)}</div>
-      <div class="sub">
-        ${badge(TASK_STATUS, r.status)}
-        ${r.pending_approvals ? `<span class="badge warn">待审批 ${r.pending_approvals}</span>` : ''}
-        <span>·</span>
-        <span>${escapeHtml(fmtTime(r.updated_at))}</span>
+
+  _lastTasksLoadAt = now;
+  _tasksInFlight = (async () => {
+    let rows;
+    try {
+      rows = await fetch(`${API}/tasks?limit=50`).then(r => r.json());
+    } catch (e) {
+      document.getElementById('tasks').innerHTML =
+        `<div class="empty">无法加载任务列表：${escapeHtml(e.message || e)}</div>`;
+      return;
+    } finally {
+      _tasksInFlight = null;
+    }
+    const el = document.getElementById('tasks');
+    if (!rows || !rows.length) {
+      el.innerHTML = '<div class="empty">暂无任务，先在飞书或 API 发起一个吧。</div>';
+      return;
+    }
+    el.innerHTML = rows.map(r => `
+      <div class="task ${r.task_id === selectedTaskId ? 'selected' : ''}"
+           onclick="selectTask('${escapeHtml(r.task_id)}')">
+        <div class="title">${escapeHtml(r.title || r.task_id)}</div>
+        <div class="sub">
+          ${badge(TASK_STATUS, r.status)}
+          ${r.pending_approvals ? `<span class="badge warn">待审批 ${r.pending_approvals}</span>` : ''}
+          <span>·</span>
+          <span>${escapeHtml(fmtTime(r.updated_at))}</span>
+        </div>
       </div>
-    </div>
-  `).join('');
+    `).join('');
+  })();
+  return _tasksInFlight;
+}
+
+function scheduleTasksReload(delayMs = TASK_LIST_MIN_RELOAD_MS) {
+  if (_tasksReloadTimer) return;
+  _tasksReloadTimer = setTimeout(() => {
+    _tasksReloadTimer = null;
+    loadTasks();
+  }, Math.max(500, delayMs));
 }
 
 async function selectTask(taskId) {
   selectedTaskId = taskId;
   document.getElementById('sidebar')?.classList.remove('open');
-  await Promise.all([loadTasks(), loadDetail()]);
+  await Promise.all([loadTasks({force:true}), loadDetail()]);
   startStream();
 }
 
@@ -594,7 +623,7 @@ function scheduleDetailReload() {
   _detailReloadTimer = setTimeout(() => {
     _detailReloadTimer = null;
     loadDetail();
-    loadTasks();
+    scheduleTasksReload();
   }, 300);
 }
 
@@ -952,7 +981,7 @@ async function decide(approvalId, decision) {
     toast('审批失败：' + (e.message || e), 'err');
     return;
   }
-  await loadDetail(); await loadTasks();
+  await loadDetail(); await loadTasks({force:true});
 }
 
 async function retry() {
@@ -992,7 +1021,7 @@ async function resumeTask(taskId) {
     if (!r.ok) throw new Error(await r.text());
     toast('已继续执行', 'ok');
   } catch (e) { toast('继续失败：' + (e.message || e), 'err'); return; }
-  await loadDetail(); await loadTasks();
+  await loadDetail(); await loadTasks({force:true});
 }
 
 // ── SSE 实时事件 ─────────────────────────────────
@@ -1045,9 +1074,9 @@ document.getElementById('menuBtn').addEventListener('click', () => {
   document.getElementById('sidebar').classList.toggle('open');
 });
 
-loadTasks();
+loadTasks({force:true});
 // 周期性刷新任务列表，便于评委在不点的情况下看到状态变化
-setInterval(loadTasks, 15000);
+setInterval(() => loadTasks(), TASK_LIST_POLL_MS);
 </script>
 </body>
 </html>

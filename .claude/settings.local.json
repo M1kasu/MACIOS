@@ -6,7 +6,9 @@
       "Bash(xargs wc -l)",
       "Bash(curl -s https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal -H 'Content-Type: application/json' -H 'Authorization: Bearer ark-68ad60ba-d1dc-4867-aa04-301c0721db85-268c3' -d '{ *)",
       "Bash(curl -s https://ark.cn-beijing.volces.com/api/v3/embeddings -H 'Content-Type: application/json' -H 'Authorization: Bearer ark-68ad60ba-d1dc-4867-aa04-301c0721db85-268c3' -d '{ *)",
-      "Bash(E:/Anaconda/envs/Agent-Hub/python.exe -m pytest tests/ -x --tb=short)"
+      "Bash(E:/Anaconda/envs/Agent-Hub/python.exe -m pytest tests/ -x --tb=short)",
+      "mcp__web-search-prime__web_search_prime",
+      "mcp__web-reader__webReader"
     ]
   }
 }

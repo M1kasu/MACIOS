@@ -47,6 +47,7 @@ async def sse_generator(
     Yields:
         SSE data 字符串（不含 ``data: `` 前缀，由 sse-starlette 框架添加）。
     """
+    yield _sse_event("accepted", "accepted", trace_id=task_input.trace_id)
     yield _sse_event("status", "processing", trace_id=task_input.trace_id)
 
     try:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -312,6 +313,62 @@ async def test_event_dispatched_to_service() -> None:
         # run_coroutine_threadsafe 发送到 loop，等待
         await asyncio.sleep(0.1)
         svc.handle_event_dict.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_im_event_handler_does_not_block_on_slow_service() -> None:
+    """IM 事件只投递到主循环，不等待长耗时任务完成。"""
+    svc = AsyncMock()
+
+    async def _slow_handle(_: dict) -> MagicMock:
+        await asyncio.sleep(0.2)
+        return MagicMock()
+
+    svc.handle_event_dict = AsyncMock(side_effect=_slow_handle)
+
+    client = FeishuLongConnClient(
+        app_id="app-1", app_secret="secret", webhook_service=svc
+    )
+
+    lark_mod = _make_mock_lark_module()
+    captured_im: list = []
+    original_builder = lark_mod.EventDispatcherHandler.builder
+
+    def _capture_builder(enc_key: str, verify_token: str) -> MagicMock:
+        hb = original_builder(enc_key, verify_token)
+
+        def _reg_im(fn):  # noqa: ANN001, ANN202
+            captured_im.append(fn)
+            return hb
+
+        hb.register_p2_im_message_receive_v1 = _reg_im
+        hb.register_p2_card_action_trigger = lambda fn: hb
+        return hb
+
+    lark_mod.EventDispatcherHandler.builder = _capture_builder
+    loop = asyncio.get_event_loop()
+
+    with patch.dict("sys.modules", _mock_lark_modules(lark_mod)):
+        t = threading.Thread(
+            target=client._run_in_thread, args=(loop,), daemon=True
+        )
+        t.start()
+        await asyncio.sleep(0.1)
+        client._stop_event.set()
+        t.join(timeout=2)
+
+    assert captured_im
+    event_data = _make_lark_event(chat_type="p2p", event_id="evt-slow")
+    started = time.perf_counter()
+    captured_im[0](event_data)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.05
+    for _ in range(30):
+        await asyncio.sleep(0.02)
+        if svc.handle_event_dict.await_count:
+            break
+    svc.handle_event_dict.assert_awaited_once()
 
 
 # ── 卡片回传交互 (card.action.trigger) ─────────────

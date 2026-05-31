@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     # ── Prompt 注入防御 ───────────────────────────────
     guard_enabled: bool = True
     guard_llm_enabled: bool = True
+    guard_llm_timeout_seconds: float = 3.0
+    guard_cache_ttl_seconds: float = 300.0
+    guard_cache_max_entries: int = 1024
 
     # ── Redis 缓存 ───────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"

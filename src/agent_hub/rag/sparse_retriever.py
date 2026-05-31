@@ -6,13 +6,30 @@ small, fast runtime index over already-loaded chunks.
 
 from __future__ import annotations
 
-import jieba
+import warnings
+from typing import Any
+
 import structlog
 from rank_bm25 import BM25Okapi
 
 from agent_hub.rag.vector_store import ChunkDoc, SearchResult
 
 logger = structlog.get_logger(__name__)
+_jieba: Any | None = None
+
+
+def _jieba_cut(text: str) -> list[str]:
+    global _jieba
+    if _jieba is None:
+        warnings.filterwarnings(
+            "ignore",
+            message="pkg_resources is deprecated as an API.*",
+            category=UserWarning,
+        )
+        import jieba
+
+        _jieba = jieba
+    return list(_jieba.cut(text))
 
 
 class SparseRetriever:
@@ -31,7 +48,7 @@ class SparseRetriever:
         if not chunks:
             return
 
-        tokenized = [list(jieba.cut(chunk.content)) for chunk in chunks]
+        tokenized = [_jieba_cut(chunk.content) for chunk in chunks]
         bm25 = BM25Okapi(tokenized)
         self._indices[(user_id, namespace)] = (bm25, list(chunks))
         logger.info(
@@ -53,7 +70,7 @@ class SparseRetriever:
             return []
 
         bm25, chunks = self._indices[key]
-        query_tokens = list(jieba.cut(query))
+        query_tokens = _jieba_cut(query)
         scores = bm25.get_scores(query_tokens)
         ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)[:top_k]
 

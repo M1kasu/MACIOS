@@ -22,9 +22,13 @@ Example::
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import re
-from typing import Protocol, cast
+import time
+from collections import OrderedDict
+from typing import Any, Protocol, cast
 
 import structlog
 from openai import AsyncOpenAI
@@ -33,6 +37,35 @@ from agent_hub.config.settings import Settings, get_settings
 from agent_hub.core.models import GuardResult
 
 logger = structlog.get_logger(__name__)
+
+
+def _setting_float(settings: Any, name: str, default: float) -> float:  # noqa: ANN401
+    value = getattr(settings, name, default)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return default
+
+
+def _setting_int(settings: Any, name: str, default: int) -> int:  # noqa: ANN401
+    value = getattr(settings, name, default)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return default
+
+
+def _exception_summary(exc: BaseException) -> str:
+    detail = str(exc) or repr(exc)
+    return f"{type(exc).__name__}: {detail}"
 
 
 class _ToolCallFunction(Protocol):
@@ -262,11 +295,16 @@ class LLMGuard:
             base_url=self._settings.llm_base_url,
         )
         self._model = self._settings.llm_model
+        self._timeout_seconds = _setting_float(
+            self._settings,
+            "guard_llm_timeout_seconds",
+            3.0,
+        )
 
     async def check(self, message: str) -> GuardResult:
         """对消息进行 LLM 语义检测。"""
         try:
-            response = await self._client.chat.completions.create(
+            request = self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=512,
                 messages=[
@@ -279,6 +317,13 @@ class LLMGuard:
                     "function": {"name": "analyze_injection"},
                 },  # type: ignore[arg-type]
             )
+            if self._timeout_seconds > 0:
+                response = await asyncio.wait_for(
+                    request,
+                    timeout=self._timeout_seconds,
+                )
+            else:
+                response = await request
 
             result = self._parse_response(response)
 
@@ -309,11 +354,16 @@ class LLMGuard:
 
         except Exception as exc:
             # LLM 检测失败时降级放行，不阻塞正常请求
-            logger.warning("guard.llm.fallback", error=str(exc))
+            error = _exception_summary(exc)
+            logger.warning(
+                "guard.llm.fallback",
+                error=error,
+                error_type=type(exc).__name__,
+            )
             return GuardResult(
                 is_safe=True,
                 risk_level="safe",
-                llm_analysis=f"LLM 检测不可用: {exc}",
+                llm_analysis=f"LLM 检测不可用: {error}",
                 confidence=0.0,
             )
 
@@ -374,6 +424,17 @@ class PromptGuard:
         self._llm_guard: LLMGuard | None = None
         if llm_enabled:
             self._llm_guard = LLMGuard(settings=self._settings)
+        self._cache_ttl_seconds = _setting_float(
+            self._settings,
+            "guard_cache_ttl_seconds",
+            300.0,
+        )
+        self._cache_max_entries = _setting_int(
+            self._settings,
+            "guard_cache_max_entries",
+            1024,
+        )
+        self._cache: OrderedDict[str, tuple[float, GuardResult]] = OrderedDict()
 
     async def check(self, message: str) -> GuardResult:
         """执行双层注入检测。"""
@@ -382,17 +443,66 @@ class PromptGuard:
         if not rule_result.is_safe:
             return rule_result
 
+        cache_key = self._cache_key(message)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         # 第二层：LLM 语义检测
         if self._llm_guard is not None:
             llm_result = await self._llm_guard.check(message)
             if not llm_result.is_safe:
+                self._remember(cache_key, llm_result)
                 return llm_result
             # suspicious 级别：合并规则结果，保留 LLM 分析
             if llm_result.risk_level == "suspicious":
+                self._remember(cache_key, llm_result)
                 return llm_result
+            if not _is_llm_unavailable(llm_result):
+                self._remember(cache_key, llm_result)
+            return llm_result
 
-        return GuardResult(
+        result = GuardResult(
             is_safe=True,
             risk_level="safe",
             confidence=1.0,
         )
+        self._remember(cache_key, result)
+        return result
+
+    def _get_cached(self, cache_key: str) -> GuardResult | None:
+        if self._cache_ttl_seconds <= 0 or self._cache_max_entries <= 0:
+            return None
+        entry = self._cache.get(cache_key)
+        if entry is None:
+            return None
+        expires_at, result = entry
+        if expires_at <= time.monotonic():
+            self._cache.pop(cache_key, None)
+            return None
+        self._cache.move_to_end(cache_key)
+        logger.debug("guard.cache.hit")
+        return result.model_copy(deep=True)
+
+    def _remember(self, cache_key: str, result: GuardResult) -> None:
+        if self._cache_ttl_seconds <= 0 or self._cache_max_entries <= 0:
+            return
+        self._cache[cache_key] = (
+            time.monotonic() + self._cache_ttl_seconds,
+            result.model_copy(deep=True),
+        )
+        self._cache.move_to_end(cache_key)
+        while len(self._cache) > self._cache_max_entries:
+            self._cache.popitem(last=False)
+
+    @staticmethod
+    def _cache_key(message: str) -> str:
+        normalized = message.strip()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _is_llm_unavailable(result: GuardResult) -> bool:
+    return (
+        result.confidence <= 0.0
+        and (result.llm_analysis or "").startswith("LLM 检测不可用")
+    )

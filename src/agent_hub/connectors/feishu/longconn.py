@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -44,6 +45,18 @@ if TYPE_CHECKING:
     from agent_hub.connectors.feishu.service import FeishuWebhookService
 
 logger = structlog.get_logger(__name__)
+
+
+def _payload_event_id(payload: dict[str, Any]) -> str:
+    header = payload.get("header")
+    if isinstance(header, dict):
+        return str(header.get("event_id") or "")
+    return ""
+
+
+def _exception_summary(exc: BaseException) -> str:
+    detail = str(exc) or repr(exc)
+    return f"{type(exc).__name__}: {detail}"
 
 
 # ── SDK 事件 → webhook dict 转换 ─────────────────────
@@ -261,6 +274,43 @@ class FeishuLongConnClient:
         asyncio.set_event_loop(thread_loop)
         _ws_mod.loop = thread_loop
 
+        def _log_dispatch_error(
+            exc: BaseException,
+            *,
+            event_kind: str,
+            payload: dict[str, Any],
+        ) -> None:
+            logger.warning(
+                "feishu.longconn.event_error",
+                event_kind=event_kind,
+                event_id=_payload_event_id(payload),
+                error=_exception_summary(exc),
+                error_type=type(exc).__name__,
+                error_repr=repr(exc),
+                exc_info=True,
+            )
+
+        def _schedule_payload(payload: dict[str, Any], event_kind: str) -> None:
+            """异步投递 IM 事件，避免占用 lark SDK 长连接线程。"""
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._service.handle_event_dict(payload),
+                    main_loop,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log_dispatch_error(exc, event_kind=event_kind, payload=payload)
+                return
+
+            def _on_done(done: concurrent.futures.Future[Any]) -> None:
+                try:
+                    done.result()
+                except concurrent.futures.CancelledError as exc:
+                    _log_dispatch_error(exc, event_kind=event_kind, payload=payload)
+                except Exception as exc:  # noqa: BLE001
+                    _log_dispatch_error(exc, event_kind=event_kind, payload=payload)
+
+            future.add_done_callback(_on_done)
+
         def _dispatch_payload(
             payload: dict[str, Any], event_kind: str,
         ) -> Any:  # noqa: ANN401
@@ -271,12 +321,12 @@ class FeishuLongConnClient:
             )
             try:
                 return future.result(timeout=30)
+            except concurrent.futures.TimeoutError as exc:
+                future.cancel()
+                _log_dispatch_error(exc, event_kind=event_kind, payload=payload)
+                return None
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "feishu.longconn.event_error",
-                    event_kind=event_kind,
-                    error=str(exc),
-                )
+                _log_dispatch_error(exc, event_kind=event_kind, payload=payload)
                 return None
 
         def _handle_im(data: Any) -> None:  # noqa: ANN401
@@ -284,7 +334,7 @@ class FeishuLongConnClient:
             if payload is None:
                 logger.warning("feishu.longconn.unparseable_event", event_kind="im")
                 return
-            _dispatch_payload(payload, "im.message.receive_v1")
+            _schedule_payload(payload, "im.message.receive_v1")
 
         def _handle_card_action(data: Any) -> Any:  # noqa: ANN401
             payload = _to_card_action_dict(data)

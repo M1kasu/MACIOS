@@ -200,6 +200,9 @@ OBSIDIAN_VAULT_PATH=./data/obsidian
 LLM_API_KEY=your_llm_api_key
 LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 LLM_MODEL=glm-4-flash
+GUARD_LLM_TIMEOUT_SECONDS=3
+GUARD_CACHE_TTL_SECONDS=300
+GUARD_CACHE_MAX_ENTRIES=1024
 ```
 
 如果你要启用真实飞书链路，再补上：

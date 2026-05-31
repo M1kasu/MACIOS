@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -275,6 +276,24 @@ class TestLLMGuard:
         assert result.risk_level == "safe"
         assert "不可用" in result.llm_analysis
 
+    @pytest.mark.asyncio
+    async def test_llm_timeout_fallback_safe(
+        self, mock_llm_guard: LLMGuard,
+    ) -> None:
+        """LLM Guard 独立超时后快速降级放行。"""
+        mock_llm_guard._timeout_seconds = 0.01
+
+        async def _slow_create(**_: object) -> MagicMock:
+            await asyncio.sleep(1)
+            return MagicMock()
+
+        mock_llm_guard._client.chat.completions.create = _slow_create
+
+        result = await mock_llm_guard.check("any message")
+        assert result.is_safe
+        assert result.risk_level == "safe"
+        assert "TimeoutError" in (result.llm_analysis or "")
+
 
 # ══════════════════════════════════════════════════════
 # PromptGuard 双层协同测试
@@ -414,6 +433,34 @@ class TestPromptGuard:
         result = await guard_with_llm.check("正常的用户请求")
         assert result.is_safe
         assert result.risk_level == "safe"
+
+    @pytest.mark.asyncio
+    async def test_guard_caches_repeated_llm_checks(
+        self, guard_with_llm: PromptGuard,
+    ) -> None:
+        """同一条消息重复检测时复用缓存，避免反复调用 LLM。"""
+        mock_tool_call = MagicMock()
+        mock_tool_call.function.arguments = json.dumps({
+            "is_injection": False,
+            "confidence": 0.05,
+            "explanation": "正常请求",
+        })
+        mock_message = MagicMock()
+        mock_message.tool_calls = [mock_tool_call]
+        mock_choice = MagicMock()
+        mock_choice.message = mock_message
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        guard_with_llm._llm_guard._client.chat.completions.create = AsyncMock(
+            return_value=mock_response,
+        )
+
+        first = await guard_with_llm.check("帮我写一个 Python 快速排序")
+        second = await guard_with_llm.check("帮我写一个 Python 快速排序")
+
+        assert first.is_safe
+        assert second.is_safe
+        guard_with_llm._llm_guard._client.chat.completions.create.assert_awaited_once()
 
 
 # ══════════════════════════════════════════════════════
