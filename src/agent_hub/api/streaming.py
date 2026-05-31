@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, TypeAlias
 import structlog
 
 if TYPE_CHECKING:
-    from agent_hub.core.models import TaskInput
-    from agent_hub.core.pipeline import AgentPipeline
+    from agent_hub.contracts.interaction import InboundRequest
+    from agent_hub.runtime.agent.turn_runtime import UnifiedTurnRuntime
 
 logger = structlog.get_logger(__name__)
 
@@ -32,38 +32,30 @@ def _sse_event(event_type: str, content: JSONValue, **extra: JSONValue) -> str:
 
 
 async def sse_generator(
-    pipeline: AgentPipeline,
-    task_input: TaskInput,
+    turn_runtime: UnifiedTurnRuntime,
+    request: InboundRequest,
 ) -> AsyncGenerator[str, None]:
-    """Pipeline 流式执行的 SSE 事件生成器。
-
-    如果 pipeline 支持 ``run_stream()``，则逐步推送。
-    否则降级为调用标准 ``run()`` 后一次性返回。
+    """UnifiedTurnRuntime 流式执行的 SSE 事件生成器。
 
     Args:
-        pipeline: AgentPipeline 实例。
-        task_input: 用户请求。
+        turn_runtime: 已初始化的 UnifiedTurnRuntime。
+        request:      规范化入站请求。
 
     Yields:
         SSE data 字符串（不含 ``data: `` 前缀，由 sse-starlette 框架添加）。
     """
-    yield _sse_event("accepted", "accepted", trace_id=task_input.trace_id)
-    yield _sse_event("status", "processing", trace_id=task_input.trace_id)
+    yield _sse_event("accepted", "accepted", trace_id=request.trace_id)
+    yield _sse_event("status", "processing", trace_id=request.trace_id)
 
     try:
-        if hasattr(pipeline, "run_stream"):
-            async for chunk in pipeline.run_stream(task_input):
-                yield _sse_event(
-                    chunk.get("type", "token"),
-                    chunk.get("content", ""),
-                    **{k: v for k, v in chunk.items() if k not in ("type", "content")},
-                )
-        else:
-            # 降级：非流式调用
-            output = await pipeline.run(task_input)
-            yield _sse_event("token", output.response)
+        async for chunk in turn_runtime.stream(request):
+            yield _sse_event(
+                chunk.get("type", "token"),
+                chunk.get("content", ""),
+                **{k: v for k, v in chunk.items() if k not in ("type", "content")},
+            )
 
-        yield _sse_event("done", "", trace_id=task_input.trace_id)
+        yield _sse_event("done", "", trace_id=request.trace_id)
 
     except Exception as exc:
         logger.error("sse_generator_error", error=str(exc))

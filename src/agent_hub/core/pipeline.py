@@ -762,7 +762,10 @@ class AgentPipeline:
         if orchestrator is None:
             return {"status": "unavailable", "error": "Pilot orchestrator is unavailable."}
 
-        from agent_hub.pilot.services.dto import PlanProfile, TaskRequest
+        import importlib
+        _dto = importlib.import_module("agent_hub.pilot.services.dto")
+        PlanProfile = _dto.PlanProfile  # noqa: N806
+        TaskRequest = _dto.TaskRequest  # noqa: N806
 
         task_text = str(args.get("task") or task_input.raw_message)
         profile_raw = args.get("plan_profile")

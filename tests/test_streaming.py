@@ -98,45 +98,45 @@ class TestSSEGenerator:
 
     @pytest.mark.asyncio
     async def test_non_streaming_fallback(self) -> None:
-        """无 run_stream 时降级到标准 run。"""
-        mock_pipeline = MagicMock()
-        mock_pipeline.run = AsyncMock()
-        mock_output = MagicMock()
-        mock_output.response = "标准回答"
-        mock_pipeline.run.return_value = mock_output
-        # 没有 run_stream 属性
-        del mock_pipeline.run_stream
+        """无流内容时，sse_generator 仍然输出 accepted / status / done。"""
+        mock_turn_runtime = MagicMock()
+
+        async def _empty_stream(_req: object) -> AsyncIterator[dict[str, str]]:
+            return
+            yield  # make it an async generator
+
+        mock_turn_runtime.stream = _empty_stream
 
         mock_input = MagicMock()
         mock_input.trace_id = "t1"
 
         events = []
-        async for event in sse_generator(mock_pipeline, mock_input):
+        async for event in sse_generator(mock_turn_runtime, mock_input):
             events.append(json.loads(event))
 
-        assert events[0]["type"] == "status"
-        assert any(e["type"] == "token" and e["content"] == "标准回答" for e in events)
+        assert events[0]["type"] == "accepted"
+        assert any(e["type"] == "status" for e in events)
         assert events[-1]["type"] == "done"
 
     @pytest.mark.asyncio
     async def test_streaming_mode(self) -> None:
-        """有 run_stream 时逐 chunk 推送。"""
-        mock_pipeline = MagicMock()
+        """turn_runtime.stream() 的 chunk 正确转发为 SSE 事件。"""
+        mock_turn_runtime = MagicMock()
 
-        async def mock_stream(_input: object) -> AsyncIterator[dict[str, str]]:
+        async def mock_stream(_req: object) -> AsyncIterator[dict[str, str]]:
             yield {"type": "token", "content": "Hello "}
             yield {"type": "token", "content": "World"}
 
-        mock_pipeline.run_stream = mock_stream
+        mock_turn_runtime.stream = mock_stream
 
         mock_input = MagicMock()
         mock_input.trace_id = "t1"
 
         events = []
-        async for event in sse_generator(mock_pipeline, mock_input):
+        async for event in sse_generator(mock_turn_runtime, mock_input):
             events.append(json.loads(event))
 
-        assert events[0]["type"] == "status"
+        assert events[0]["type"] == "accepted"
         tokens = [e["content"] for e in events if e["type"] == "token"]
         assert "Hello " in tokens
         assert "World" in tokens
@@ -144,20 +144,20 @@ class TestSSEGenerator:
 
     @pytest.mark.asyncio
     async def test_error_handling(self) -> None:
-        """异常时推送 error 事件。"""
-        mock_pipeline = MagicMock()
+        """stream() 抛异常时推送 error 事件。"""
+        mock_turn_runtime = MagicMock()
 
-        async def mock_stream(_input: object) -> AsyncIterator[dict[str, str]]:
+        async def mock_stream(_req: object) -> AsyncIterator[dict[str, str]]:
             raise RuntimeError("LLM 炸了")
             yield {"type": "token", "content": ""}
 
-        mock_pipeline.run_stream = mock_stream
+        mock_turn_runtime.stream = mock_stream
 
         mock_input = MagicMock()
         mock_input.trace_id = "t1"
 
         events = []
-        async for event in sse_generator(mock_pipeline, mock_input):
+        async for event in sse_generator(mock_turn_runtime, mock_input):
             events.append(json.loads(event))
 
         assert any(e["type"] == "error" for e in events)

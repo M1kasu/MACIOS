@@ -214,6 +214,7 @@ def interactions_app() -> Iterator[FastAPI]:
     from agent_hub.api.interactions_routes import build_interactions_router
     from agent_hub.api.pilot_runtime import build_pilot_runtime
     from agent_hub.config.settings import Settings
+    from agent_hub.contracts.turn import TurnResult
 
     settings = Settings(
         api_keys=["test-key"],
@@ -229,6 +230,25 @@ def interactions_app() -> Iterator[FastAPI]:
     )
     runtime = build_pilot_runtime(settings)
 
+    # mock UnifiedTurnRuntime.handle() 根据文本内容返回不同 TurnResult
+    mock_turn_runtime = MagicMock()
+
+    async def _mock_handle(inbound: object) -> TurnResult:
+        text = getattr(inbound, "text", "") or ""
+        trace_id = getattr(inbound, "trace_id", "trace-mock")
+        # 群聊且未 @bot → ignore（source_context.is_at_bot=False + group）
+        src = getattr(inbound, "source_context", None)
+        from agent_hub.contracts.identity import SourceChatType
+        if src and getattr(src, "chat_type", None) is SourceChatType.GROUP and not src.is_at_bot:
+            return TurnResult(trace_id=trace_id)
+        if not text:
+            return TurnResult(trace_id=trace_id)
+        if any(kw in text for kw in ("PPT", "ppt", "汇报", "任务")):
+            return TurnResult(trace_id=trace_id, task_id="t1", workspace_id="ws1")
+        return TurnResult(trace_id=trace_id, reply_text=f"关于「{text}」的回答")
+
+    mock_turn_runtime.handle = AsyncMock(side_effect=_mock_handle)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
@@ -237,7 +257,7 @@ def interactions_app() -> Iterator[FastAPI]:
             await runtime.aclose()
 
     fa = FastAPI(lifespan=lifespan)
-    fa.include_router(build_interactions_router(runtime))
+    fa.include_router(build_interactions_router(runtime, mock_turn_runtime))
     yield fa
 
 

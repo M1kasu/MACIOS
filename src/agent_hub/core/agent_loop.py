@@ -204,6 +204,7 @@ class AgentTurnLoop:
                     "content": call.name,
                     "tool_name": call.name,
                     "call_id": call_id,
+                    "result": result,
                 }
                 messages.append(
                     {

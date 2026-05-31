@@ -1,11 +1,13 @@
-"""把规范化的飞书消息接到 ``TaskOrchestrator`` 上。
+"""把规范化的飞书消息接到 ``UnifiedTurnRuntime`` 上。
 
 仅通过 WebSocket 长连接模式接收事件，处理流程：
 
-1. 通过 ``feishu_chat_id`` 复用 / 创建 :class:`Workspace`；
-2. 拼装 :class:`TaskRequest` 并提交；
-3. 通过 :class:`FeishuClientProtocol` 回复一条 ACK 文本，方便用户感知
-   接收成功。ACK 不走审批，属于连接器自身的事务性消息。
+1. 将消息规范化为 :class:`InboundRequest`；
+2. 交由 :class:`UnifiedTurnRuntime` 流式执行（AgentTurnLoop 决策）；
+3. 检测到 ``start_pilot_task`` 工具启动时立即发送 ACK；
+   普通问答则在流结束后回复文本。
+4. 审批卡片回调（``card.action.trigger``）直接交给
+   :class:`PilotCommandService` 处理，不经过 AgentTurnLoop。
 """
 
 from __future__ import annotations
@@ -27,18 +29,16 @@ from agent_hub.connectors.feishu.webhook import (
     FeishuWebhookProcessor,
     FeishuWebhookResult,
 )
-from agent_hub.pilot.domain.enums import WorkspaceStatus
-from agent_hub.pilot.domain.models import Workspace
-from agent_hub.pilot.services.dto import PlanProfile, TaskHandle, TaskRequest
-from agent_hub.pilot.services.ingress import IngressIntent, PilotIngressService
+from agent_hub.pilot.domain.enums import TaskStatus
+from agent_hub.pilot.services.dto import TaskHandle
+from agent_hub.pilot.services.ingress import IngressIntent
 from agent_hub.pilot.skills.feishu_card import build_decision_card
 
 if TYPE_CHECKING:
     from agent_hub.contracts.interaction import InboundRequest
     from agent_hub.pilot.services.commands import PilotCommandService
-    from agent_hub.pilot.services.interaction import InteractionService
-    from agent_hub.pilot.services.orchestrator import TaskOrchestrator
     from agent_hub.pilot.services.repository import PilotRepository
+    from agent_hub.runtime.agent.turn_runtime import UnifiedTurnRuntime
 
 logger = structlog.get_logger(__name__)
 
@@ -64,36 +64,31 @@ class FeishuWebhookService:
     """飞书长连接入站处理服务。
 
     Args:
-        processor: 事件解析器（去重 + 规范化 + 过滤）。
-        orchestrator: 提交 task 的入口。
-        repository: 用于按 ``feishu_chat_id`` 查找已有 workspace。
-        client: 飞书出站客户端，用于回 ACK；为 ``None`` 时不回复
-            （单元测试或 dry-run 部署）。
-        ack_template: ACK 文案模板，``{title}`` 会被替换为 task 截断
-            后的标题。
-        send_ack: 是否发送 ACK；关闭后只创建 task。
+        processor:    事件解析器（去重 + 规范化 + 过滤）。
+        client:       飞书出站客户端；``None`` 时不回复（测试 / dry-run）。
+        commands:     审批决策服务；``None`` 时卡片回调静默处理。
+        repository:   可选仓储，仅用于审批卡片更新查询。
+        turn_runtime: 统一对话运行时；``None`` 时 ACCEPTED 消息将被忽略。
+        ack_template: ACK 文案模板，``{title}`` 替换为消息截断标题。
+        send_ack:     是否发送 ACK；关闭后不回复（仅创建 task）。
     """
 
     def __init__(
         self,
         *,
         processor: FeishuWebhookProcessor,
-        orchestrator: TaskOrchestrator,
-        repository: PilotRepository,
         client: FeishuClientProtocol | None = None,
         commands: PilotCommandService | None = None,
-        ingress: PilotIngressService | None = None,
-        interaction_service: InteractionService | None = None,
+        repository: PilotRepository | None = None,
+        turn_runtime: UnifiedTurnRuntime | None = None,
         ack_template: str = "收到任务，开始执行，正在规划：{title}",
         send_ack: bool = True,
     ) -> None:
         self._processor = processor
-        self._orchestrator = orchestrator
-        self._repo = repository
         self._client = client
         self._commands = commands
-        self._ingress = ingress
-        self._interaction_service = interaction_service
+        self._repo = repository
+        self._turn_runtime = turn_runtime
         self._ack_template = ack_template
         self._send_ack = send_ack
 
@@ -116,120 +111,90 @@ class FeishuWebhookService:
                 reason="processor returned no message",
             )
 
-        # —— 统一入口：优先走 InteractionService，否则使用旧 PilotIngressService 路径。
-        # 卡片回调（CARD_CALLBACK）已在方法开头单独处理，不进入分流逻辑。
-        if self._interaction_service is not None:
-            from agent_hub.contracts.interaction import InteractionIntent
-
-            inbound = self._to_inbound_request(message)
-            pre_ack_id: str | None = None
-            try:
-                predicted_intent, _, _, _ = self._interaction_service.classify(inbound)
-            except Exception:  # noqa: BLE001 - pre-ack is best-effort only
-                predicted_intent = None
-            if predicted_intent is InteractionIntent.START_TASK:
-                pre_ack_id = await self._maybe_ack(message)
-
-            ir = await self._interaction_service.handle(inbound)
-            logger.info(
-                "feishu.interaction.handled",
-                intent=ir.intent.value,
-                chat_id=message.chat_id,
-                reason=ir.decision_reason,
-            )
-            if ir.intent is InteractionIntent.IGNORE:
-                return FeishuAckResult(
-                    outcome=FeishuWebhookOutcome.IGNORED,
-                    reason=ir.decision_reason or "interaction_ignore",
-                    intent=IngressIntent.IGNORE,
-                )
-            if ir.intent is InteractionIntent.START_TASK:
-                task_handle = None
-                if ir.task_id and ir.workspace_id and ir.task_status is not None:
-                    task_handle = TaskHandle(
-                        workspace_id=ir.workspace_id,
-                        task_id=ir.task_id,
-                        plan_id=ir.plan_id,
-                        status=ir.task_status,
-                        trace_id=ir.trace_id,
-                        deduplicated=ir.deduplicated,
-                    )
-                ack_id = pre_ack_id
-                if ack_id is None:
-                    ack_id = await self._maybe_ack(message, task_handle)
-                return FeishuAckResult(
-                    outcome=FeishuWebhookOutcome.ACCEPTED,
-                    handle=task_handle,
-                    ack_message_id=ack_id,
-                    intent=IngressIntent.START_TASK,
-                )
-            if ir.intent is InteractionIntent.ORDINARY_QA:
-                reply_id = await self._send_text_reply(message, ir.reply_text)
-                return FeishuAckResult(
-                    outcome=FeishuWebhookOutcome.ACCEPTED,
-                    intent=IngressIntent.ORDINARY_QA,
-                    reply_message_id=reply_id,
-                )
-            if ir.intent is InteractionIntent.PROGRESS_QUERY:
-                reply_id = await self._send_text_reply(message, ir.reply_text)
-                return FeishuAckResult(
-                    outcome=FeishuWebhookOutcome.ACCEPTED,
-                    intent=IngressIntent.PROGRESS_QUERY,
-                    reply_message_id=reply_id,
-                )
-            # CLARIFY 或未知意图：静默处理
+        if self._turn_runtime is None:
             return FeishuAckResult(
                 outcome=FeishuWebhookOutcome.IGNORED,
-                reason=ir.decision_reason or "unhandled_intent",
+                reason="turn_runtime not configured",
             )
 
-        # —— 旧 Ingress 分流（向后兼容）
-        if self._ingress is not None:
-            decision = await self._ingress.dispatch(message)
-            logger.info(
-                "feishu.ingress.classified",
-                chat_id=message.chat_id,
-                intent=decision.intent.value,
-                matched=list(decision.matched_keywords),
-                reason=decision.reason,
+        inbound = self._to_inbound_request(message)
+        ack_id: str | None = None
+        reply_parts: list[str] = []
+        task_id: str | None = None
+        workspace_id: str | None = None
+        plan_id: str | None = None
+        task_status_str: str | None = None
+        deduplicated: bool = False
+
+        try:
+            async for chunk in self._turn_runtime.stream(inbound):
+                chunk_type = chunk.get("type", "")
+                content = chunk.get("content", "")
+
+                if (
+                    chunk_type == "tool_started"
+                    and chunk.get("tool_name") == "start_pilot_task"
+                    and ack_id is None
+                ):
+                    # 检测到任务启动 → 提前发送 ACK，不等流结束
+                    ack_id = await self._maybe_ack(message)
+                elif chunk_type in ("token", "final") and content:
+                    reply_parts.append(str(content))
+                elif chunk_type == "tool_finished":
+                    tool_result = chunk.get("result")
+                    if (
+                        isinstance(tool_result, dict)
+                        and tool_result.get("status") == "started"
+                        and tool_result.get("task_id")
+                    ):
+                        task_id = tool_result.get("task_id")
+                        workspace_id = tool_result.get("workspace_id")
+                        plan_id = tool_result.get("plan_id")
+                        task_status_str = tool_result.get("task_status")
+                        deduplicated = bool(tool_result.get("deduplicated", False))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("feishu.service.turn_failed", error=str(exc))
+            return FeishuAckResult(
+                outcome=FeishuWebhookOutcome.IGNORED,
+                reason=f"turn_error: {exc}",
             )
-            if decision.intent is IngressIntent.IGNORE:
-                return FeishuAckResult(
-                    outcome=FeishuWebhookOutcome.IGNORED,
-                    reason=decision.reason or "ingress_ignore",
-                    intent=decision.intent,
+
+        if task_id:
+            try:
+                status_enum = (
+                    TaskStatus(task_status_str) if task_status_str else TaskStatus.CREATED
                 )
-            if decision.intent in (
-                IngressIntent.ORDINARY_QA,
-                IngressIntent.PROGRESS_QUERY,
-            ):
-                reply_id = await self._send_text_reply(
-                    message, decision.reply_text
-                )
-                return FeishuAckResult(
-                    outcome=FeishuWebhookOutcome.ACCEPTED,
-                    intent=decision.intent,
-                    reply_message_id=reply_id,
-                )
-            # START_TASK fallthrough：先发 ACK，再提交任务
-            ack_message_id = await self._maybe_ack(message)
-            handle = await self._submit_task(
-                message,
-                plan_profile=decision.plan_profile,
+            except ValueError:
+                status_enum = TaskStatus.CREATED
+            task_handle = TaskHandle(
+                workspace_id=workspace_id or "",
+                task_id=task_id,
+                plan_id=plan_id,
+                status=status_enum,
+                trace_id=inbound.trace_id,
+                deduplicated=deduplicated,
             )
+            if ack_id is None:
+                ack_id = await self._maybe_ack(message, task_handle)
             return FeishuAckResult(
                 outcome=FeishuWebhookOutcome.ACCEPTED,
-                handle=handle,
-                ack_message_id=ack_message_id,
-                intent=decision.intent,
+                handle=task_handle,
+                ack_message_id=ack_id,
+                intent=IngressIntent.START_TASK,
             )
 
-        ack_message_id = await self._maybe_ack(message)
-        handle = await self._submit_task(message)
+        reply_text = "".join(reply_parts) or None
+        if reply_text:
+            reply_id = await self._send_text_reply(message, reply_text)
+            return FeishuAckResult(
+                outcome=FeishuWebhookOutcome.ACCEPTED,
+                intent=IngressIntent.ORDINARY_QA,
+                reply_message_id=reply_id,
+            )
+
         return FeishuAckResult(
-            outcome=FeishuWebhookOutcome.ACCEPTED,
-            handle=handle,
-            ack_message_id=ack_message_id,
+            outcome=FeishuWebhookOutcome.IGNORED,
+            reason="no_response",
         )
 
     # ── 内部 ───────────────────────────────────────
@@ -384,68 +349,6 @@ class FeishuWebhookService:
             attachments=[a.file_key for a in message.attachments],
             message_type=message.message_type.value,
         )
-
-    async def _submit_task(
-        self,
-        message: FeishuInboundMessage,
-        *,
-        plan_profile: PlanProfile | None = None,
-    ) -> TaskHandle:
-        workspace = await self._find_or_create_workspace(message)
-        request = TaskRequest(
-            source_channel=SOURCE_CHANNEL,
-            raw_text=message.text or "",
-            requester_id=message.sender_id,
-            title=_derive_title(message),
-            source_conversation_id=message.chat_id,
-            source_message_id=message.message_id,
-            workspace_id=workspace.workspace_id,
-            tenant_key=message.tenant_key,
-            attachments=[a.file_key for a in message.attachments],
-            idempotency_key=_idempotency_key(message),
-            auto_approve=True,
-            plan_profile=plan_profile,
-            metadata={
-                "feishu_event_id": message.event_id,
-                "feishu_chat_type": message.chat_type.value,
-                "feishu_message_type": message.message_type.value,
-                "feishu_app_id": message.app_id or "",
-                "feishu_bot_mentioned": message.bot_mentioned,
-                "plan_profile": plan_profile.value if plan_profile else "",
-                **_private_delivery_metadata(message),
-            },
-        )
-        handle = await self._orchestrator.submit(request)
-        logger.info(
-            "feishu.webhook.task_submitted",
-            workspace_id=handle.workspace_id,
-            task_id=handle.task_id,
-            chat_id=message.chat_id,
-            deduplicated=handle.deduplicated,
-        )
-        return handle
-
-    async def _find_or_create_workspace(self, message: FeishuInboundMessage) -> Workspace:
-        workspaces = await self._repo.list_workspaces()
-        for ws in workspaces:
-            if ws.feishu_chat_id == message.chat_id:
-                return ws
-        workspace = Workspace(
-            tenant_key=message.tenant_key,
-            title=_derive_title(message),
-            source_channel=SOURCE_CHANNEL,
-            source_conversation_id=message.chat_id,
-            feishu_chat_id=message.chat_id,
-            created_by=message.sender_id,
-            members=[message.sender_id],
-            status=WorkspaceStatus.ACTIVE,
-            metadata={
-                "feishu_chat_type": message.chat_type.value,
-                "feishu_app_id": message.app_id or "",
-            },
-        )
-        await self._repo.save(workspace, expected_version=None)
-        return workspace
 
     async def _maybe_ack(
         self,

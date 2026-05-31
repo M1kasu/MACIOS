@@ -37,8 +37,6 @@ from agent_hub.pilot.services.artifacts import ArtifactStore
 from agent_hub.pilot.services.commands import PilotCommandService
 from agent_hub.pilot.services.event_publisher import PilotEventPublisher
 from agent_hub.pilot.services.execution import ExecutionEngine
-from agent_hub.pilot.services.ingress import PilotIngressService
-from agent_hub.pilot.services.interaction import InteractionService
 from agent_hub.pilot.services.model_gateway import (
     ModelGateway,
     OpenAIModelGateway,
@@ -61,6 +59,7 @@ from agent_hub.pilot.skills.registry import SkillRegistry
 
 if TYPE_CHECKING:
     from agent_hub.core.pipeline import AgentPipeline
+    from agent_hub.runtime.agent.turn_runtime import UnifiedTurnRuntime
 
 logger = structlog.get_logger(__name__)
 
@@ -85,8 +84,6 @@ class PilotRuntime:
     queries: PilotQueryService
     commands: PilotCommandService
     brief_generator: BriefGenerator
-    ingress: PilotIngressService
-    interaction_service: InteractionService
     feishu_client: FeishuClientProtocol | None = None
     feishu_webhook_service: FeishuWebhookService | None = None
     feishu_long_conn: FeishuLongConnClient | None = None
@@ -110,13 +107,14 @@ def build_pilot_runtime(
     settings: Settings,
     *,
     pipeline: AgentPipeline | None = None,
+    turn_runtime: UnifiedTurnRuntime | None = None,
 ) -> PilotRuntime:
     """根据 ``Settings`` 构造一个完整可用的 PilotRuntime。
 
     Args:
-        settings: 运行时配置。
-        pipeline: 可选注入的通用 ``AgentPipeline``，供 ``PilotIngressService``
-            处理普通问答场景。为 ``None`` 时普通问答退化为提示文案。
+        settings:     运行时配置。
+        pipeline:     保留参数（尚局路由调试用）；新代码不需要。
+        turn_runtime: 预先创建的 UnifiedTurnRuntime，注入到飞书连接器。
     """
     if settings.pilot_store_path:
         store: EventStore | SQLiteEventStore = SQLiteEventStore(
@@ -188,33 +186,12 @@ def build_pilot_runtime(
     queries = PilotQueryService(repo, store)
     commands = PilotCommandService(repo, approvals, orchestrator, publisher)
 
-    async def _lookup_workspace_by_chat(chat_id: str):  # noqa: ANN202
-        for ws in await repo.list_workspaces():
-            if ws.feishu_chat_id == chat_id:
-                return ws
-        return None
-
-    ingress = PilotIngressService(
-        pipeline=pipeline,
-        queries=queries,
-        repository_lookup=_lookup_workspace_by_chat,
-    )
-    interaction_service = InteractionService(
-        pipeline=pipeline,
-        queries=queries,
-        orchestrator=orchestrator,
-        repository=repo,
-    )
-
     feishu_client, feishu_webhook_service, feishu_long_conn = _maybe_build_feishu(
         settings,
         registry=registry,
         artifact_reader=artifacts.read_content_by_id,
-        orchestrator=orchestrator,
-        repository=repo,
         commands=commands,
-        ingress=ingress,
-        interaction_service=interaction_service,
+        turn_runtime=turn_runtime,
     )
     if feishu_client is not None:
         notifier = FeishuApprovalNotifier(repo, feishu_client)
@@ -264,8 +241,6 @@ def build_pilot_runtime(
         queries=queries,
         commands=commands,
         brief_generator=brief_generator,
-        ingress=ingress,
-        interaction_service=interaction_service,
         feishu_client=feishu_client,
         feishu_webhook_service=feishu_webhook_service,
         feishu_long_conn=feishu_long_conn,
@@ -278,11 +253,8 @@ def _maybe_build_feishu(
     *,
     registry: SkillRegistry,
     artifact_reader,  # noqa: ANN001 - bound method
-    orchestrator: TaskOrchestrator,
-    repository: PilotRepository,
     commands: PilotCommandService | None = None,
-    ingress: PilotIngressService | None = None,
-    interaction_service: InteractionService | None = None,
+    turn_runtime: UnifiedTurnRuntime | None = None,
 ) -> tuple[FeishuClientProtocol | None, FeishuWebhookService | None, FeishuLongConnClient | None]:
     """根据配置可选地装配飞书连接器。
 
@@ -324,12 +296,9 @@ def _maybe_build_feishu(
     )
     webhook_service = FeishuWebhookService(
         processor=processor,
-        orchestrator=orchestrator,
-        repository=repository,
         client=client,
         commands=commands,
-        ingress=ingress,
-        interaction_service=interaction_service,
+        turn_runtime=turn_runtime,
     )
     # 长连接模式：主动连接飞书 WebSocket 服务器，无需公网地址
     long_conn = FeishuLongConnClient(

@@ -5,8 +5,8 @@
 "我知道我要做什么"的开发者直接调用。
 
 请求接受一组简洁字段，内部构造 :class:`InboundRequest` 并交给
-:class:`InteractionService` 处理，实现"私聊 / 群聊 / API 模拟输入
-→ 统一 InteractionService → 普通问答 / 复杂任务 / 进度查询 / 忽略"
+:class:`UnifiedTurnRuntime` 处理，实现"私聊 / 群聊 / API 模拟输入
+→ AgentTurnLoop → 普通问答 / 复杂任务 / 进度查询 / 忽略"
 的全链路。
 """
 
@@ -28,6 +28,7 @@ from agent_hub.contracts.interaction import InboundRequest
 
 if TYPE_CHECKING:
     from agent_hub.api.pilot_runtime import PilotRuntime
+    from agent_hub.runtime.agent.turn_runtime import UnifiedTurnRuntime
 
 
 # ── 请求 / 响应模型 ────────────────────────────────────────────────────────────
@@ -88,11 +89,14 @@ class InteractionResponse(BaseModel):
 # ── 路由工厂 ──────────────────────────────────────────────────────────────────
 
 
-def build_interactions_router(runtime: PilotRuntime) -> APIRouter:
+def build_interactions_router(
+    runtime: PilotRuntime,
+    turn_runtime: UnifiedTurnRuntime,
+) -> APIRouter:
     """构造并返回 ``/api/interactions`` 路由器。
 
     被 :func:`agent_hub.api.routes.lifespan` 在 Pilot 启用时调用，
-    动态注入 ``runtime``。
+    动态注入 ``runtime`` 和 ``turn_runtime``。
     """
     router = APIRouter(
         prefix="/api/interactions",
@@ -138,11 +142,21 @@ def build_interactions_router(runtime: PilotRuntime) -> APIRouter:
             message_type=req.message_type,
         )
 
-        result = await runtime.interaction_service.handle(inbound)
+        result = await turn_runtime.handle(inbound)
+
+        # 从 TurnResult 推导意图
+        if result.task_id:
+            intent = "start_task"
+        elif result.status == "blocked":
+            intent = "blocked"
+        elif result.reply_text:
+            intent = "ordinary_qa"
+        else:
+            intent = "ignore"
 
         # 填充 events_url（需要 public_url helper）
-        events_url: str | None = None
-        if result.task_id:
+        events_url: str | None = result.events_url
+        if result.task_id and not events_url:
             try:
                 events_url = runtime.settings.public_url(
                     f"/api/pilot/tasks/{result.task_id}/events"
@@ -151,15 +165,15 @@ def build_interactions_router(runtime: PilotRuntime) -> APIRouter:
                 events_url = f"/api/pilot/tasks/{result.task_id}/events"
 
         return InteractionResponse(
-            intent=result.intent.value,
+            intent=intent,
             trace_id=result.trace_id,
             reply_text=result.reply_text,
             task_id=result.task_id,
             workspace_id=result.workspace_id,
             plan_id=result.plan_id,
             events_url=events_url,
-            decision_reason=result.decision_reason,
-            matched_keywords=list(result.matched_keywords),
+            decision_reason=None,
+            matched_keywords=[],
             deduplicated=result.deduplicated,
         )
 

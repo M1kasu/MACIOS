@@ -24,11 +24,13 @@ from agent_hub.api.pilot_routes import build_pilot_router
 from agent_hub.api.pilot_runtime import PilotRuntime, build_pilot_runtime
 from agent_hub.api.rag_routes import build_rag_router
 from agent_hub.config.settings import Settings, get_settings
+from agent_hub.contracts.interaction import InboundRequest
 from agent_hub.core.enums import UserRole
-from agent_hub.core.models import SourceContext, TaskInput, UserContext
+from agent_hub.core.models import SourceContext, UserContext
 from agent_hub.core.pipeline import AgentPipeline
 from agent_hub.core.trace_store import InMemoryTraceStore, get_trace_store, set_trace_store
 from agent_hub.core.tracer import init_tracer
+from agent_hub.runtime.agent.turn_runtime import UnifiedTurnRuntime
 
 logger = structlog.get_logger(__name__)
 
@@ -37,12 +39,19 @@ logger = structlog.get_logger(__name__)
 _pipeline: AgentPipeline | None = None
 _settings: Settings | None = None
 _pilot_runtime: PilotRuntime | None = None
+_turn_runtime: UnifiedTurnRuntime | None = None
 
 
 def _get_pipeline() -> AgentPipeline:
     if _pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline 未初始化")
     return _pipeline
+
+
+def _get_turn_runtime() -> UnifiedTurnRuntime:
+    if _turn_runtime is None:
+        raise HTTPException(status_code=503, detail="UnifiedTurnRuntime 未初始化")
+    return _turn_runtime
 
 
 def get_pilot_runtime() -> PilotRuntime:
@@ -81,22 +90,25 @@ def _resolve_dashboard_dir(static_dir: str) -> Path | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期：启动时初始化 Pipeline / Pilot，关闭时清理资源。"""
-    global _pipeline, _settings, _pilot_runtime  # noqa: PLW0603
+    global _pipeline, _settings, _pilot_runtime, _turn_runtime  # noqa: PLW0603
     _settings = get_settings()
     init_tracer("agent-hub-api")
     # 注册进程内 TraceStore（供 /trace/{id} 查询）
     set_trace_store(InMemoryTraceStore())
     _pipeline = AgentPipeline(_settings)
+    _turn_runtime = UnifiedTurnRuntime(_pipeline)
     if not getattr(app.state, "rag_router_mounted", False):
         app.include_router(build_rag_router(lambda: _get_pipeline().rag_pipeline))
         app.state.rag_router_mounted = True
 
     if _settings.pilot_enabled:
-        _pilot_runtime = build_pilot_runtime(_settings, pipeline=_pipeline)
+        _pilot_runtime = build_pilot_runtime(
+            _settings, pipeline=_pipeline, turn_runtime=_turn_runtime
+        )
         _pipeline.attach_pilot_runtime(_pilot_runtime)
         app.include_router(build_pilot_router(_pilot_runtime))
         from agent_hub.api.interactions_routes import build_interactions_router
-        app.include_router(build_interactions_router(_pilot_runtime))
+        app.include_router(build_interactions_router(_pilot_runtime, _turn_runtime))
         if (
             _settings.feishu_enabled
             and _pilot_runtime.feishu_webhook_service is not None
@@ -136,6 +148,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _pipeline.rag_pipeline.close()
     _pipeline = None
     _pilot_runtime = None
+    _turn_runtime = None
     logger.info("api_stopped")
 
 
@@ -189,31 +202,29 @@ class ChatResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     """统一对话入口。"""
-    pipeline = _get_pipeline()
+    turn_runtime = _get_turn_runtime()
 
-    user_ctx = UserContext(
-        user_id=req.user_id,
-        role=UserRole(req.role),
-    )
-    source_context = req.source_context.model_copy(
-        update={"sender_id": req.source_context.sender_id or req.user_id}
-    )
-
-    task_input = TaskInput(
+    inbound = InboundRequest(
         trace_id=req.trace_id or str(uuid.uuid4()),
-        user_context=user_ctx,
-        source_context=source_context,
-        raw_message=req.message,
+        user_context=UserContext(
+            user_id=req.user_id,
+            role=UserRole(req.role),
+        ),
+        source_context=req.source_context.model_copy(
+            update={"sender_id": req.source_context.sender_id or req.user_id}
+        ),
+        text=req.message,
         attachments=[],
+        message_type="text",
     )
 
-    output = await pipeline.run(task_input)
+    result = await turn_runtime.handle(inbound)
 
     return ChatResponse(
-        trace_id=output.trace_id,
-        response=output.response,
-        status=output.status,
-        total_duration_ms=output.total_duration_ms,
+        trace_id=result.trace_id,
+        response=result.reply_text or result.error or "",
+        status=result.status,
+        total_duration_ms=result.total_duration_ms,
     )
 
 
@@ -265,22 +276,20 @@ async def chat_stream(req: ChatRequest) -> EventSourceResponse:
     """
     from agent_hub.api.streaming import sse_generator
 
-    pipeline = _get_pipeline()
+    turn_runtime = _get_turn_runtime()
 
-    user_ctx = UserContext(
-        user_id=req.user_id,
-        role=UserRole(req.role),
-    )
-    source_context = req.source_context.model_copy(
-        update={"sender_id": req.source_context.sender_id or req.user_id}
-    )
-
-    task_input = TaskInput(
+    inbound = InboundRequest(
         trace_id=req.trace_id or str(uuid.uuid4()),
-        user_context=user_ctx,
-        source_context=source_context,
-        raw_message=req.message,
+        user_context=UserContext(
+            user_id=req.user_id,
+            role=UserRole(req.role),
+        ),
+        source_context=req.source_context.model_copy(
+            update={"sender_id": req.source_context.sender_id or req.user_id}
+        ),
+        text=req.message,
         attachments=[],
+        message_type="text",
     )
 
-    return EventSourceResponse(sse_generator(pipeline, task_input))
+    return EventSourceResponse(sse_generator(turn_runtime, inbound))
