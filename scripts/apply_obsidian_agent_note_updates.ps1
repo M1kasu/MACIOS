@@ -90,7 +90,7 @@ tags:
 
 ## 2 分钟讲法
 
-> 这个项目的核心是把 Agent 放进一个可控的办公流程里。入口层支持 API 和飞书，飞书消息先经过 webhook/长连接规范化，再由 Ingress 判断是普通问答、进度查询还是任务请求。进入 Pilot 后，系统创建 Task，生成 Plan 和 PlanStep；计划和高风险步骤会进入审批，审批通过后由 ExecutionEngine 调用 Skill，生成 Brief、SlideSpec、PPTX、Drive 分享链接和 Summary 等 Artifact。
+> 这个项目的核心是把 Agent 放进一个可控的办公流程里。入口层支持 API 和飞书，飞书消息先经过 webhook/长连接规范化为 InboundRequest，再统一进入 UnifiedTurnRuntime；AgentTurnLoop 在同一回合里决定直接回答、查询进度还是调用 start_pilot_task。进入 Pilot 后，系统创建 Task，生成 Plan 和 PlanStep；计划和高风险步骤会进入审批，审批通过后由 ExecutionEngine 调用 Skill，生成 Brief、SlideSpec、PPTX、Drive 分享链接和 Summary 等 Artifact。
 >
 > 我主要做了三类事情。第一是执行过程数据化，把 task、plan、step、approval、skill、artifact 的状态统一记录成 ExecutionEvent，用 trace_id/task_id 串起来，方便 Dashboard 回放和失败定位。第二是任务编排和可靠性，通用 AgentPipeline 用 Kahn 拓扑分层和 asyncio.gather 并行执行同层子任务；Pilot 链路为了审批一致性，按 DAG 层顺序推进，并支持 blocked 后 resume、步骤重试和模板 fallback。第三是检索评估闭环，用 pgvector + BM25 + RRF 做混合检索，并保留评测脚本计算 Recall@5、Precision@5、MRR。
 >

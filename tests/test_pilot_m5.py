@@ -410,51 +410,30 @@ async def test_openai_gateway_network_error_falls_back() -> None:
     assert bp.metadata["gateway"] == "template"
 
 
-# ── Ingress profile 派生 ─────────────────────────────
+# ── AgentLoop task profile 派生 ──────────────────────
 
 
-def test_ingress_classify_derives_summary_profile() -> None:
-    from agent_hub.connectors.feishu.models import (
-        FeishuChatType,
-        FeishuInboundMessage,
-        FeishuMessageType,
+def test_task_profile_derives_summary_profile() -> None:
+    profile = derive_plan_profile(
+        PlanContext(
+            raw_text="帮我整理一下纪要总结",
+            requester_id="u1",
+            source_channel="feishu",
+            source_conversation_id="c1",
+            source_message_id="m1",
+        )
     )
-    from agent_hub.pilot.services.ingress import IngressIntent, PilotIngressService
+    assert profile == PlanProfile.SUMMARY_ONLY
 
-    ingress = PilotIngressService()
-    msg = FeishuInboundMessage(
-        event_id="e1",
-        event_type="im.message.receive_v1",
-        message_id="m1",
-        chat_id="c1",
-        sender_id="u1",
-        chat_type=FeishuChatType.P2P,
-        message_type=FeishuMessageType.TEXT,
-        text="帮我整理一下纪要总结",
+
+def test_task_profile_deck_default_for_ppt() -> None:
+    profile = derive_plan_profile(
+        PlanContext(
+            raw_text="帮我做个 ppt 汇报",
+            requester_id="u1",
+            source_channel="feishu",
+            source_conversation_id="c1",
+            source_message_id="m1",
+        )
     )
-    decision = ingress.classify(msg)
-    assert decision.intent == IngressIntent.START_TASK
-    assert decision.plan_profile == PlanProfile.SUMMARY_ONLY
-
-
-def test_ingress_classify_deck_default_for_ppt() -> None:
-    from agent_hub.connectors.feishu.models import (
-        FeishuChatType,
-        FeishuInboundMessage,
-        FeishuMessageType,
-    )
-    from agent_hub.pilot.services.ingress import PilotIngressService
-
-    ingress = PilotIngressService()
-    msg = FeishuInboundMessage(
-        event_id="e1",
-        event_type="im.message.receive_v1",
-        message_id="m1",
-        chat_id="c1",
-        sender_id="u1",
-        chat_type=FeishuChatType.P2P,
-        message_type=FeishuMessageType.TEXT,
-        text="帮我做个 ppt 汇报",
-    )
-    decision = ingress.classify(msg)
-    assert decision.plan_profile == PlanProfile.DECK_FULL
+    assert profile == PlanProfile.DECK_FULL

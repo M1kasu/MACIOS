@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -14,6 +15,7 @@ from agent_hub.connectors.feishu import (
     FeishuWebhookProcessor,
     FeishuWebhookService,
 )
+from agent_hub.contracts.turn import TurnIntent
 from agent_hub.pilot import (
     ApprovalService,
     ArtifactStore,
@@ -252,8 +254,6 @@ def _make_turn_runtime_mock(
     reply_text: str | None = None,
 ) -> MagicMock:
     """构造 UnifiedTurnRuntime mock，模拟 stream() 产出 chunks。"""
-    from unittest.mock import MagicMock
-
     mock = MagicMock()
 
     async def _stream(_inbound: object):
@@ -321,14 +321,12 @@ async def test_service_reuses_workspace_for_same_chat() -> None:
     assert a.handle.workspace_id == b.handle.workspace_id
 
 
-# ── Ingress 注入下的 START_TASK 路径（回归 ack 死代码 bug） ──
+# ── UnifiedTurnRuntime 下的 START_TASK 路径（回归 ack 死代码 bug） ──
 
 
 @pytest.mark.asyncio
-async def test_service_with_ingress_p2p_start_task_acks_and_creates_task() -> None:
+async def test_service_with_turn_runtime_p2p_start_task_acks_and_creates_task() -> None:
     """turn_runtime 返回 task_id 时，P2P 文本任务消息应：发 ACK + 创建 task。"""
-    from agent_hub.pilot.services.ingress import IngressIntent
-
     fake_client = FakeFeishuClient()
     proc = FeishuWebhookProcessor()
     turn_runtime = _make_turn_runtime_mock(task_id="task_p2p", workspace_id="ws_p2p")
@@ -347,17 +345,15 @@ async def test_service_with_ingress_p2p_start_task_acks_and_creates_task() -> No
     )
 
     assert result.outcome is FeishuWebhookOutcome.ACCEPTED
-    assert result.intent is IngressIntent.START_TASK
+    assert result.intent is TurnIntent.START_TASK
     assert result.handle is not None, "START_TASK 必须创建 task"
     assert result.ack_message_id is not None, "START_TASK 必须发 ACK"
     assert len(fake_client.sent_messages) == 1
 
 
 @pytest.mark.asyncio
-async def test_service_with_ingress_group_mention_start_task_acks() -> None:
+async def test_service_with_turn_runtime_group_mention_start_task_acks() -> None:
     """群聊 @bot 的任务文本走 START_TASK 分支也要发 ACK。"""
-    from agent_hub.pilot.services.ingress import IngressIntent
-
     fake_client = FakeFeishuClient()
     proc = FeishuWebhookProcessor(
         bot_open_id="ou_bot",
@@ -381,7 +377,7 @@ async def test_service_with_ingress_group_mention_start_task_acks() -> None:
     )
 
     assert result.outcome is FeishuWebhookOutcome.ACCEPTED
-    assert result.intent is IngressIntent.START_TASK
+    assert result.intent is TurnIntent.START_TASK
     assert result.handle is not None
     assert result.ack_message_id is not None
     assert len(fake_client.sent_messages) == 1
@@ -418,10 +414,8 @@ async def test_service_with_interaction_group_task_acks_private_delivery_text() 
 
 
 @pytest.mark.asyncio
-async def test_service_with_ingress_ordinary_qa_does_not_create_task() -> None:
+async def test_service_with_turn_runtime_ordinary_qa_does_not_create_task() -> None:
     """ORDINARY_QA 路径不会创建 task，也不应发 ACK。"""
-    from agent_hub.pilot.services.ingress import IngressIntent
-
     fake_client = FakeFeishuClient()
     proc = FeishuWebhookProcessor()
     turn_runtime = _make_turn_runtime_mock(task_id=None, reply_text="你好啊，有什么可以帮你？")
@@ -440,7 +434,7 @@ async def test_service_with_ingress_ordinary_qa_does_not_create_task() -> None:
     )
 
     assert result.handle is None
-    assert result.intent in (IngressIntent.ORDINARY_QA, IngressIntent.IGNORE, None)
+    assert result.intent in (TurnIntent.ORDINARY_QA, TurnIntent.IGNORE, None)
 
 
 # ── Card callback (M5 审批) ────────────────────────

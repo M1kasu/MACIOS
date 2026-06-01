@@ -58,7 +58,7 @@ async def benchmark() -> None:
         )
 
         start = time.monotonic()
-        output = await pipeline.run(task_input)
+        output = await pipeline.run_router_plan(task_input)
         elapsed = int((time.monotonic() - start) * 1000)
 
         print(f"{message:<30} {expected_intent:<20} {elapsed:<10} {output.status}")

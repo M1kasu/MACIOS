@@ -22,8 +22,8 @@ class PlanProfile(StrEnum):
 
     Profile 决定 :class:`PlanningService` 校验所需的 ``PlanStepKind`` 集合，
     以及 :class:`TemplatePlanGateway` 生成的默认 blueprint 模板。
-    与 :class:`agent_hub.pilot.services.ingress.IngressIntent` 解耦：
-    Ingress 决定消息是否走 START_TASK，profile 决定具体生成什么。
+    AgentTurnLoop 决定是否调用 ``start_pilot_task``；profile 只描述任务
+    计划形态，不承担入口意图分类。
     """
 
     DECK_FULL = "deck_full"

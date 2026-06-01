@@ -23,7 +23,7 @@ import structlog
 
 from agent_hub.contracts.execution import TaskInput
 from agent_hub.contracts.interaction import InboundRequest
-from agent_hub.contracts.turn import TurnEvent, TurnResult
+from agent_hub.contracts.turn import TurnEvent, TurnIntent, TurnResult, TurnStatus
 
 if TYPE_CHECKING:
     from agent_hub.core.pipeline import AgentPipeline
@@ -76,6 +76,7 @@ class UnifiedTurnRuntime:
         - ``tool_finished``        → 检查 ``result["status"] == "started"``
                                      且 ``result["task_id"]`` 非空时提取
                                      任务元数据
+        - ``blocked``              → 设置 ``status="blocked"``
         - ``error``                → 设置 ``status="error"``
 
         Args:
@@ -92,7 +93,8 @@ class UnifiedTurnRuntime:
         task_status: str | None = None
         deduplicated: bool = False
         events_url: str | None = None
-        status = "success"
+        status = TurnStatus.SUCCESS
+        intent = TurnIntent.IGNORE
         error: str | None = None
 
         try:
@@ -102,7 +104,12 @@ class UnifiedTurnRuntime:
 
                 if chunk_type in ("token", "final") and content:
                     reply_parts.append(str(content))
+                    if intent is TurnIntent.IGNORE:
+                        intent = TurnIntent.ORDINARY_QA
                 elif chunk_type == "tool_finished":
+                    tool_name = chunk.get("tool_name")
+                    if tool_name == "query_task_status":
+                        intent = TurnIntent.PROGRESS_QUERY
                     result = chunk.get("result")
                     if (
                         isinstance(result, dict)
@@ -115,8 +122,16 @@ class UnifiedTurnRuntime:
                         task_status = result.get("task_status")
                         deduplicated = bool(result.get("deduplicated", False))
                         events_url = result.get("events_url")
+                        intent = TurnIntent.START_TASK
+                elif chunk_type == "blocked":
+                    status = TurnStatus.BLOCKED
+                    intent = TurnIntent.BLOCKED
+                    if content:
+                        reply_parts.append(str(content))
+                    break
                 elif chunk_type == "error":
-                    status = "error"
+                    status = TurnStatus.ERROR
+                    intent = TurnIntent.ERROR
                     error = str(content) if content else "unknown error"
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -124,16 +139,21 @@ class UnifiedTurnRuntime:
                 trace_id=request.trace_id,
                 error=str(exc),
             )
-            status = "error"
+            status = TurnStatus.ERROR
+            intent = TurnIntent.ERROR
             error = str(exc)
 
         reply_text = "".join(reply_parts) or None
 
-        # Guard 拦截时 pipeline 产出 type="error" content 含 "blocked"；
-        # 或直接抛出，此处统一映射。
-        if status != "error" and error is None and reply_text is None and task_id is None:
-            # stream 为空或 pipeline 拒绝服务；视为 blocked
-            pass  # 保持 status="success"，调用方自行判断
+        if status is TurnStatus.SUCCESS:
+            if task_id:
+                intent = TurnIntent.START_TASK
+            elif intent is TurnIntent.PROGRESS_QUERY:
+                pass
+            elif reply_text:
+                intent = TurnIntent.ORDINARY_QA
+            else:
+                intent = TurnIntent.IGNORE
 
         return TurnResult(
             trace_id=request.trace_id,
@@ -144,6 +164,7 @@ class UnifiedTurnRuntime:
             task_status=task_status,
             deduplicated=deduplicated,
             events_url=events_url,
+            intent=intent,
             status=status,
             error=error,
             total_duration_ms=int((time.monotonic() - start) * 1000),

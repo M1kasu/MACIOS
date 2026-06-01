@@ -25,6 +25,7 @@ from agent_hub.contracts.identity import (
     UserRole,
 )
 from agent_hub.contracts.interaction import InboundRequest
+from agent_hub.contracts.turn import TurnIntent
 
 if TYPE_CHECKING:
     from agent_hub.api.pilot_runtime import PilotRuntime
@@ -144,15 +145,16 @@ def build_interactions_router(
 
         result = await turn_runtime.handle(inbound)
 
-        # 从 TurnResult 推导意图
-        if result.task_id:
-            intent = "start_task"
-        elif result.status == "blocked":
-            intent = "blocked"
-        elif result.reply_text:
-            intent = "ordinary_qa"
-        else:
-            intent = "ignore"
+        intent = getattr(result.intent, "value", result.intent)
+        if intent == TurnIntent.IGNORE.value:
+            if result.status == "blocked":
+                intent = TurnIntent.BLOCKED.value
+            elif result.status == "error":
+                intent = TurnIntent.ERROR.value
+            elif result.task_id:
+                intent = TurnIntent.START_TASK.value
+            elif result.reply_text:
+                intent = TurnIntent.ORDINARY_QA.value
 
         # 填充 events_url（需要 public_url helper）
         events_url: str | None = result.events_url

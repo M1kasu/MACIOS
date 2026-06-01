@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -162,3 +162,40 @@ class TestSSEGenerator:
 
         assert any(e["type"] == "error" for e in events)
         assert events[-1]["type"] == "done"
+
+
+class TestUnifiedTurnRuntime:
+    @pytest.mark.asyncio
+    async def test_handle_maps_blocked_chunk_to_blocked_status(self) -> None:
+        from agent_hub.contracts.identity import (
+            SourceChatType,
+            SourceContext,
+            UserContext,
+            UserRole,
+        )
+        from agent_hub.contracts.interaction import InboundRequest
+        from agent_hub.contracts.turn import TurnIntent, TurnStatus
+        from agent_hub.runtime.agent.turn_runtime import UnifiedTurnRuntime
+
+        pipeline = MagicMock()
+
+        async def _blocked_stream(_task_input: object) -> AsyncIterator[dict[str, str]]:
+            yield {"type": "blocked", "content": "请求已被拦截"}
+
+        pipeline.run_stream = _blocked_stream
+        runtime = UnifiedTurnRuntime(pipeline)
+        result = await runtime.handle(
+            InboundRequest(
+                trace_id="trace-blocked",
+                user_context=UserContext(user_id="u1", role=UserRole.USER),
+                source_context=SourceContext(
+                    channel="api",
+                    chat_type=SourceChatType.DIRECT,
+                ),
+                text="blocked",
+            )
+        )
+
+        assert result.status is TurnStatus.BLOCKED
+        assert result.intent is TurnIntent.BLOCKED
+        assert result.reply_text == "请求已被拦截"

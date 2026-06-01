@@ -166,7 +166,7 @@ class TestPipelineGroupChatFallback:
             new_callable=AsyncMock,
             return_value=_mock_routing(ExecutionMode.IGNORE, 0.9),
         ):
-            result = await pipeline.run(_make_task("哈哈"))
+            result = await pipeline.run_router_plan(_make_task("哈哈"))
             assert result.status == "fallback"
 
     @pytest.mark.asyncio
@@ -178,7 +178,7 @@ class TestPipelineGroupChatFallback:
             new_callable=AsyncMock,
             return_value=_mock_routing(ExecutionMode.PLAN, 0.3),
         ):
-            result = await pipeline.run(_make_task("嗯嗯"))
+            result = await pipeline.run_router_plan(_make_task("嗯嗯"))
             assert result.status == "fallback"
 
 
@@ -192,7 +192,7 @@ class TestPipelineAdminPermission:
             new_callable=AsyncMock,
             return_value=_mock_routing(ExecutionMode.DELEGATE, 0.95),
         ):
-            result = await pipeline.run(_make_task("重启服务器", role=UserRole.USER))
+            result = await pipeline.run_router_plan(_make_task("重启服务器", role=UserRole.USER))
             assert result.status == "permission_denied"
 
     @pytest.mark.asyncio
@@ -215,7 +215,7 @@ class TestPipelineAdminPermission:
             new_callable=AsyncMock,
             return_value=routing,
         ):
-            result = await pipeline.run(_make_task("echo hello", role=UserRole.ADMIN))
+            result = await pipeline.run_router_plan(_make_task("echo hello", role=UserRole.ADMIN))
             # 不应是 permission_denied
             assert result.status != "permission_denied"
 
@@ -250,7 +250,7 @@ class TestPipelineAdminPermission:
             patch.object(pipeline._risk_policy, "assess", return_value=risk),
             patch.object(pipeline._risk_policy, "apply", return_value=routing),
         ):
-            result = await pipeline.run(_make_task("sensitive", role=UserRole.USER))
+            result = await pipeline.run_router_plan(_make_task("sensitive", role=UserRole.USER))
 
         assert result.status == "permission_denied"
 
@@ -266,7 +266,7 @@ class TestPipelineTraceId:
             return_value=_mock_routing(ExecutionMode.IGNORE),
         ):
             task = _make_task(trace_id="my-trace-123")
-            result = await pipeline.run(task)
+            result = await pipeline.run_router_plan(task)
             assert result.trace_id == "my-trace-123"
 
 
@@ -306,7 +306,7 @@ class TestPipelineAgentExecution:
                 return_value=mock_agent_result,
             ),
         ):
-            result = await pipeline.run(_make_task("写冒泡排序"))
+            result = await pipeline.run_router_plan(_make_task("写冒泡排序"))
             assert result.status == "success"
             assert len(result.agent_results) == 1
             assert "bubble_sort" in result.response
@@ -331,7 +331,7 @@ class TestPipelineAgentExecution:
             new_callable=AsyncMock,
             return_value=routing,
         ):
-            result = await pipeline.run(_make_task("test"))
+            result = await pipeline.run_router_plan(_make_task("test"))
             assert result.status == "success"
             assert result.agent_results[0].success is False
             assert "未知" in result.agent_results[0].error
@@ -347,6 +347,6 @@ class TestPipelineErrorHandling:
             new_callable=AsyncMock,
             side_effect=RuntimeError("LLM 调用失败"),
         ):
-            result = await pipeline.run(_make_task("test"))
+            result = await pipeline.run_router_plan(_make_task("test"))
             assert result.status == "error"
             assert "LLM 调用失败" in result.response

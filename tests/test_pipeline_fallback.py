@@ -235,7 +235,7 @@ class TestPipelineFallback:
                 plan=[],
             ),
         ):
-            output = await pipeline.run(task_input)
+            output = await pipeline.run_router_plan(task_input)
 
         assert output.status == "success"
         assert output.response == "我很好"

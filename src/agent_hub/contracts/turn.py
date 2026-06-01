@@ -11,10 +11,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 # 流式事件 = AgentTurnLoop 产出的 dict chunk（type / content / …）
 TurnEvent = dict[str, Any]
+
+
+class TurnStatus(StrEnum):
+    """通道无关的回合状态。"""
+
+    SUCCESS = "success"
+    BLOCKED = "blocked"
+    ERROR = "error"
+
+
+class TurnIntent(StrEnum):
+    """从回合执行结果推导出的用户可见走向。"""
+
+    IGNORE = "ignore"
+    ORDINARY_QA = "ordinary_qa"
+    PROGRESS_QUERY = "progress_query"
+    START_TASK = "start_task"
+    BLOCKED = "blocked"
+    ERROR = "error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +50,7 @@ class TurnResult:
         task_status:       ``start_pilot_task`` 时的任务状态字符串。
         deduplicated:      ``start_pilot_task`` 幂等命中时为 ``True``。
         events_url:        任务 SSE 事件流 URL。
+        intent:            从实际执行结果推导的走向，不做入口规则分类。
         status:            ``"success"`` | ``"blocked"`` | ``"error"``。
         error:             ``status == "error"`` 时的错误描述。
         total_duration_ms: 端到端耗时（毫秒）。
@@ -43,9 +64,10 @@ class TurnResult:
     task_status: str | None = None
     deduplicated: bool = False
     events_url: str | None = None
-    status: str = "success"
+    intent: TurnIntent = TurnIntent.IGNORE
+    status: TurnStatus = TurnStatus.SUCCESS
     error: str | None = None
     total_duration_ms: int = 0
 
 
-__all__ = ["TurnEvent", "TurnResult"]
+__all__ = ["TurnEvent", "TurnIntent", "TurnResult", "TurnStatus"]

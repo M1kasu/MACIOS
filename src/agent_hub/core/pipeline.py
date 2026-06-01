@@ -1,7 +1,8 @@
 """主控 Pipeline。
 
-接收 ``TaskInput``，串联 **路由 → 权限 → Agent 执行 → 记忆写入**，
-返回 ``TaskOutput``。所有步骤均在 :class:`SpanContext` 追踪下运行。
+接收 ``TaskInput``，默认通过 ``AgentTurnLoop`` 流式执行。旧的
+``DecisionRouter`` DAG 执行仍保留为显式工具/调试路径，不再是自然语言
+主入口的第一步。所有步骤均在 :class:`SpanContext` 追踪下运行。
 
 无依赖的子任务通过 ``asyncio.gather`` 并行执行（DAG 拓扑排序分层）。
 
@@ -379,7 +380,7 @@ class AgentPipeline:
         trace_id: str,
         root_span: SpanContext | None = None,
     ) -> _PreparedExecution:
-        """Build once, consume in both ``run`` and ``run_stream``."""
+        """Prepare the explicit DecisionRouter/DAG execution path."""
         source_context = self._resolve_source_context(task_input)
         user_ctx = task_input.user_context
 
@@ -715,6 +716,13 @@ class AgentPipeline:
                     "success": result.success,
                     "output": result.output,
                     "error": result.error,
+                    "duration_ms": result.duration_ms,
+                    "trace_id": result.trace_id,
+                    "react_trace": (
+                        result.react_trace.model_dump()
+                        if result.react_trace is not None
+                        else None
+                    ),
                 }
                 for result in results
             ],
@@ -880,7 +888,11 @@ class AgentPipeline:
         trace_id = task_input.trace_id or get_current_trace_id()
         prepared = await self._prepare_agent_loop_execution(task_input, trace_id)
         if prepared.blocked_response is not None:
-            yield {"type": "error", "content": prepared.blocked_response}
+            yield {
+                "type": "blocked",
+                "content": prepared.blocked_response,
+                "status": prepared.blocked_status or "blocked",
+            }
             return
         if prepared.binding is None:
             yield {"type": "error", "content": "Execution preparation failed."}
@@ -929,31 +941,116 @@ class AgentPipeline:
         except Exception as exc:  # noqa: BLE001
             logger.warning("stream_memory_save_failed", error=str(exc))
 
-    # ── 主入口 ───────────────────────────────────────
+    # ── 非流式兼容入口 ───────────────────────────────
 
     async def run(self, task_input: TaskInput) -> TaskOutput:
-        """Pipeline 主入口。
+        """非流式兼容入口，收集 ``run_stream()`` 结果为 ``TaskOutput``。
 
-        完整流程：
-
-        1. 路由决策（DecisionRouter）
-        2. GROUP_CHAT / 低置信度 fallback
-        3. 权限校验（ADMIN_COMMAND）
-        4. Agent 执行（DAG 拓扑排序 → 同层 asyncio.gather 并行）
-        5. 构建最终回复
-        6. 记忆写入
-
-        Args:
-            task_input: 用户请求。
-
-        Returns:
-            TaskOutput: 端到端结果。
+        自然语言主路径统一走 AgentTurnLoop。需要旧 DecisionRouter/DAG
+        计划时，模型会显式调用 ``run_decision_router_plan`` 工具。
         """
         trace_id = task_input.trace_id or get_current_trace_id()
         user_ctx = task_input.user_context
         start_time = time.monotonic()
 
-        with SpanContext("pipeline.run", trace_id) as root_span:
+        reply_parts: list[str] = []
+        fallback_response: str | None = None
+        status = "success"
+        artifacts: list[Artifact] = []
+        agent_results: list[AgentResult] = []
+        error: str | None = None
+
+        with SpanContext("pipeline.run", trace_id):
+            try:
+                async for chunk in self.run_stream(task_input):
+                    chunk_type = chunk.get("type")
+                    content = chunk.get("content")
+                    if chunk_type in {"token", "final"} and content:
+                        reply_parts.append(str(content))
+                    elif chunk_type == "blocked":
+                        return TaskOutput(
+                            trace_id=trace_id,
+                            user_id=user_ctx.user_id,
+                            response=str(content or ""),
+                            agent_results=[],
+                            memory_saved=[],
+                            total_duration_ms=self._elapsed_ms(start_time),
+                            status=str(chunk.get("status") or "blocked"),
+                        )
+                    elif chunk_type == "error":
+                        status = "error"
+                        error = str(content or "unknown error")
+                    elif chunk_type == "tool_finished":
+                        result = chunk.get("result")
+                        if isinstance(result, dict):
+                            response = result.get("response")
+                            if isinstance(response, str) and response:
+                                fallback_response = response
+                            raw_artifacts = result.get("artifacts")
+                            if isinstance(raw_artifacts, list):
+                                for item in raw_artifacts:
+                                    if isinstance(item, dict):
+                                        try:
+                                            artifacts.append(Artifact.model_validate(item))
+                                        except Exception as exc:  # noqa: BLE001
+                                            logger.debug(
+                                                "stream_artifact_ignored",
+                                                error=str(exc),
+                                            )
+                            raw_agent_results = result.get("agent_results")
+                            if isinstance(raw_agent_results, list):
+                                for item in raw_agent_results:
+                                    if isinstance(item, dict):
+                                        try:
+                                            agent_results.append(
+                                                AgentResult.model_validate(item),
+                                            )
+                                        except Exception as exc:  # noqa: BLE001
+                                            logger.debug(
+                                                "stream_agent_result_ignored",
+                                                error=str(exc),
+                                            )
+                            if result.get("status") == "started" and result.get("task_id"):
+                                fallback_response = f"任务已启动：{result['task_id']}"
+            except Exception as exc:  # noqa: BLE001
+                total_ms = self._elapsed_ms(start_time)
+                logger.error("pipeline_error", trace_id=trace_id, error=str(exc))
+                return TaskOutput(
+                    trace_id=trace_id,
+                    user_id=user_ctx.user_id,
+                    response=f"系统异常：{exc}",
+                    agent_results=[],
+                    memory_saved=[],
+                    total_duration_ms=total_ms,
+                    status="error",
+                )
+
+        response = "".join(reply_parts) or fallback_response
+        if response is None:
+            response = error or "任务已接收，未触发可见输出。"
+
+        return TaskOutput(
+            trace_id=trace_id,
+            user_id=user_ctx.user_id,
+            response=response,
+            agent_results=agent_results,
+            memory_saved=[],
+            artifacts=artifacts,
+            total_duration_ms=self._elapsed_ms(start_time),
+            status=status,
+        )
+
+    async def run_router_plan(self, task_input: TaskInput) -> TaskOutput:
+        """显式运行 DecisionRouter/DAG 调试路径。
+
+        这是 ``run_decision_router_plan`` 工具背后的兼容执行能力，用于底层
+        调试和单元测试；自然语言主入口请使用 ``run_stream()`` / ``run()``。
+        """
+        trace_id = task_input.trace_id or get_current_trace_id()
+        user_ctx = task_input.user_context
+        start_time = time.monotonic()
+
+        with SpanContext("pipeline.run_router_plan", trace_id) as root_span:
             try:
                 prepared = await self._prepare_execution(
                     task_input,
@@ -989,7 +1086,6 @@ class AgentPipeline:
                 risk = prepared.risk
                 session_id = routing.session_key or prepared.binding.session_key
 
-                # ── Step 1.5: 三级缓存查询（启用时） ─────
                 if self._cache is not None:
                     try:
                         hit = await self._cache.get(
@@ -1010,7 +1106,6 @@ class AgentPipeline:
                             status="cache_hit",
                         )
 
-                # ── Step 2: ignore / 低置信度降级 ────────
                 if routing.mode == ExecutionMode.IGNORE or routing.low_confidence:
                     return TaskOutput(
                         trace_id=trace_id,
@@ -1022,7 +1117,6 @@ class AgentPipeline:
                         status="fallback",
                     )
 
-                # ── Step 3: 权限校验 ─────────────────────
                 if risk.requires_admin and user_ctx.role != UserRole.ADMIN:
                     return TaskOutput(
                         trace_id=trace_id,
@@ -1034,13 +1128,11 @@ class AgentPipeline:
                         status="permission_denied",
                     )
 
-                # ── Step 3.5: 兜底 — 无计划但 mode 可执行时，自动生成默认子任务
                 if not routing.plan and routing.mode != ExecutionMode.IGNORE:
                     routing = self._ensure_default_subtask(
                         routing, task_input.raw_message,
                     )
 
-                # ── Step 3.6: 子任务后处理 — 修正 required_agents 以触发 ReAct
                 routing = self._postprocess_subtasks(routing)
                 validation = self._plan_validator.validate(
                     routing.plan,
@@ -1057,16 +1149,12 @@ class AgentPipeline:
                         status="invalid_plan",
                     )
 
-                # ── Step 4: Agent 执行（DAG 并行） ───────
                 agent_results = await self._execute_dag(
                     routing.plan, task_input, trace_id, routing,
                 )
-
-                # ── Step 5: 构建回复 ─────────────────────
                 response = self._build_response(routing, agent_results)
                 artifacts = self._collect_artifacts(agent_results)
 
-                # ── Step 5.5: 缓存回写（启用时） ─────────
                 if self._cache is not None and response:
                     try:
                         await self._cache.set(
@@ -1075,14 +1163,13 @@ class AgentPipeline:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("cache_set_failed", error=str(exc))
 
-                # ── Step 6: 记忆写入 ─────────────────────
                 memory_saved = self._save_memory(
                     task_input, routing, agent_results, session_id,
                 )
 
                 total_ms = self._elapsed_ms(start_time)
                 logger.info(
-                    "pipeline_complete",
+                    "router_plan_complete",
                     trace_id=trace_id,
                     mode=routing.mode.value,
                     duration_ms=total_ms,
@@ -1099,9 +1186,9 @@ class AgentPipeline:
                     status="success",
                 )
 
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 total_ms = self._elapsed_ms(start_time)
-                logger.error("pipeline_error", trace_id=trace_id, error=str(exc))
+                logger.error("router_plan_error", trace_id=trace_id, error=str(exc))
                 return TaskOutput(
                     trace_id=trace_id,
                     user_id=user_ctx.user_id,

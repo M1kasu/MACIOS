@@ -4,7 +4,7 @@
 通过 sse-starlette 推送给客户端。
 
 事件格式：
-    data: {"type": "token"|"status"|"done"|"error", "content": "..."}\n\n
+    data: {"type": "token"|"status"|"blocked"|"done"|"error", "content": "..."}\n\n
 """
 
 from __future__ import annotations

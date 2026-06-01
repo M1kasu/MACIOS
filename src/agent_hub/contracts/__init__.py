@@ -72,7 +72,6 @@ from agent_hub.contracts.identity import (
 # ── interaction ──────────────────────────────────────────────────────────────
 from agent_hub.contracts.interaction import (
     InboundRequest,
-    InteractionIntent,
 )
 
 # ── policy ────────────────────────────────────────────────────────────────────
@@ -81,6 +80,14 @@ from agent_hub.contracts.policy import (
     PermissionProfile,
     PolicyDecision,
     RiskLevel,
+)
+
+# ── turn ─────────────────────────────────────────────────────────────────────
+from agent_hub.contracts.turn import (
+    TurnEvent,
+    TurnIntent,
+    TurnResult,
+    TurnStatus,
 )
 
 __all__ = [
@@ -108,7 +115,11 @@ __all__ = [
     "ToolSpec",
     # interaction
     "InboundRequest",
-    "InteractionIntent",
+    # turn
+    "TurnEvent",
+    "TurnIntent",
+    "TurnResult",
+    "TurnStatus",
     # policy
     "GuardResult",
     "PermissionProfile",

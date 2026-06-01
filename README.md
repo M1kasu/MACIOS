@@ -16,9 +16,9 @@
 Agent-Hub 可以按两个层次理解：
 
 1. **通用 Agent 执行内核**
-   核心入口是 `DecisionRouter + SourceBindingResolver + RiskPolicy + SubTaskPlanValidator + AgentPipeline + LLMAgent / RetrievalAgent / ToolAgent / ReflectionAgent + Memory + PromptGuard`，负责"理解请求、确定性绑定、风险评估、计划校验、拆解任务、读取 Skill/MCP/Plugin 能力定义、检索知识、写入记忆、流式返回"。
+   核心入口是 `UnifiedTurnRuntime + AgentPipeline.run_stream() + AgentTurnLoop + SourceBindingResolver + PromptGuard + Memory`，负责"接收入站请求、确定性绑定、按需调用工具、读取 Skill/MCP/Plugin 能力定义、检索知识、写入记忆、流式返回"。`DecisionRouter` 仍作为显式工具用于复杂 DAG 计划，不再是自然语言主入口的第一跳。
 2. **Agent-Pilot 业务运行时**
-   Pilot 在通用引擎之上补齐任务化与协作化能力：`Workspace / Task / Plan / PlanStep / Approval / Artifact / ExecutionEvent`，并提供 Dashboard、SSE、审批恢复、飞书入口与 PPT 产物链路。飞书入站消息由 `PilotIngressService` 做意图分流（IGNORE / ORDINARY_QA / PROGRESS_QUERY / START_TASK），避免所有消息被强制塞进任务链路。
+   Pilot 在通用引擎之上补齐任务化与协作化能力：`Workspace / Task / Plan / PlanStep / Approval / Artifact / ExecutionEvent`，并提供 Dashboard、SSE、审批恢复、飞书入口与 PPT 产物链路。飞书入站消息会先规范化为 `InboundRequest`，再进入同一个 `UnifiedTurnRuntime`，由模型在回合中按需调用 `answer_directly`、`query_task_status` 或 `start_pilot_task`。
 
 如果你只想验证 Agent 编排内核，可以从 `/chat` 与 `/chat/stream` 开始。
 如果你想看完整的"任务规划 → 审批 → 执行 → 产物 → 多端同步"闭环，请直接使用 `/api/pilot/*` 与 `/dashboard/`。
@@ -54,7 +54,7 @@ Agent-Hub 可以按两个层次理解：
 | 事件化 Pilot | 任务、步骤、审批、产物状态都写入 `ExecutionEvent`，支持 SSE 回放与实时订阅 |
 | 审批与恢复 | 支持计划审批、步骤审批、失败恢复与 blocked task resume；高风险操作（写入、分享）自动触发审批 |
 | 多端同步 | Dashboard 通过 SSE 订阅同一条事件流；飞书可选推送进度与审批卡片 |
-| Pilot 意图分流 | `PilotIngressService` 用确定性关键词启发式将飞书入站消息分为 IGNORE / ORDINARY_QA / PROGRESS_QUERY / START_TASK，解决所有消息被强制塞进任务链路的问题 |
+| 统一回合入口 | HTTP、飞书和评测入口统一进入 `UnifiedTurnRuntime`；普通问答、进度查询和长任务启动都由 AgentTurnLoop 的工具调用结果推导 |
 
 ## 当前实现边界
 
@@ -62,12 +62,12 @@ Agent-Hub 可以按两个层次理解：
 
 ### 架构边界
 
-- 通用 AgentPipeline 的主编排是自研 DAG + `asyncio.gather`，不是用 LangGraph 驱动全系统。Pipeline 完整流程为：`SourceBindingResolver → DecisionRouter → RiskPolicy → SubTaskPlanValidator → Agent 执行 → Memory 写入 → 流式返回`。
+- 通用自然语言主编排是 `UnifiedTurnRuntime → AgentPipeline.run_stream() → AgentTurnLoop`，不是用 LangGraph 驱动全系统。复杂 DAG 执行需要由 AgentTurnLoop 显式调用 `run_decision_router_plan`，该工具内部再走 `DecisionRouter → RiskPolicy → SubTaskPlanValidator → Agent 执行 → Memory 写入`。
 - Router 只给出执行建议（mode、capabilities、plan），所有权限相关字段（tool_profile、risk_level、requires_approval、route_source、session_key）均由 `SourceBindingResolver` 和 `RiskPolicy` 确定性计算，不信任 LLM 输出。
 - `capabilities/` 负责读取和规范化 `SKILL.md`、`.mcp.json`、`.claude-plugin/plugin.json`；不会在本地启动 MCP server，也不会把 Skill 当成可执行函数注册。
 - Pilot 业务执行引擎优先保证审批状态一致性：它按 DAG 层推进，但同层 step 当前是顺序执行；DAG 并行压测只对应通用 AgentPipeline 的调度效果，不代表飞书审批全链路端到端耗时。
 - LangGraph 目前只用于 `reflection_agent` 的检索纠错子流程。
-- `PilotIngressService` 的意图分流基于确定性关键词启发式，未接入 LLM 分类；后续可在不破坏接口的情况下替换为 LLM Router 兜底。
+- 入口层不再维护关键词/规则式意图服务；是否回答、查进度或启动 Pilot 任务由 AgentTurnLoop 在同一回合中通过工具调用决定。
 
 ### 连接器边界
 
@@ -91,22 +91,29 @@ graph TD
     API --> FEISHU["/api/feishu/webhook"]
     API --> DASH["/dashboard/"]
 
-    CHAT --> PIPE[AgentPipeline]
-    PIPE --> ROUTER["DecisionRouter (6 modes)"]
+    CHAT --> TURN["UnifiedTurnRuntime"]
+    FEISHU --> TURN
+    TURN --> PIPE["AgentPipeline.run_stream"]
     PIPE --> BINDING["SourceBindingResolver"]
-    PIPE --> RISK["RiskPolicy + ToolProfile"]
-    PIPE --> VALIDATOR["SubTaskPlanValidator"]
-    PIPE --> LLM["LLMAgent + ReAct"]
+    PIPE --> LOOP["AgentTurnLoop"]
+    LOOP --> ANSWER["answer_directly"]
+    LOOP --> STATUS["query_task_status"]
+    LOOP --> START["start_pilot_task"]
+    LOOP --> ROUTER_TOOL["run_decision_router_plan"]
+    ROUTER_TOOL --> ROUTER["DecisionRouter (6 modes)"]
+    ROUTER --> RISK["RiskPolicy + ToolProfile"]
+    RISK --> VALIDATOR["SubTaskPlanValidator"]
+    VALIDATOR --> LLM["LLMAgent + ReAct"]
     PIPE --> RET[RetrievalAgent]
     PIPE --> TOOL[ToolAgent]
     PIPE --> REFLECT[ReflectionAgent]
     PIPE --> MEM[MemoryManager]
-    PIPE --> GUARD["PromptGuard → RiskPolicy"]
+    PIPE --> GUARD["PromptGuard"]
 
     PILOT --> RUNTIME[PilotRuntime]
-    FEISHU --> RUNTIME
-    RUNTIME --> INGRESS["PilotIngressService (4 intents)"]
     RUNTIME --> ORCH[TaskOrchestrator]
+    START --> ORCH
+    STATUS --> RUNTIME
     ORCH --> PLAN[PlanningService]
     ORCH --> APPROVAL[ApprovalService]
     ORCH --> EXEC[ExecutionEngine]
@@ -488,9 +495,9 @@ docker compose up -d --build app
 
 `LLMAgent` 在需要工具时会进入 ReAct 循环；工具调用受 `ToolProfile` 约束，`RiskPolicy.tool_allowed()` 按工具的 `risk_level` / `side_effect` / `tool_profiles` 与当前 profile 做权限检查。当前工具层不再注册本地 demo 可执行函数，MCP tool 只在本地承载 schema 和来源信息，实际执行应交给 MCP 客户端连接外部服务。
 
-### 6. Pilot 意图分流
+### 6. 统一回合入口
 
-`PilotIngressService` 用确定性关键词启发式将飞书入站消息分为四种意图（IGNORE / ORDINARY_QA / PROGRESS_QUERY / START_TASK），避免了所有消息被强制塞进任务链路的问题。群聊中仅在 @机器人 时才触发 QA，避免无端打扰。
+HTTP、飞书和评测模拟器都先归一化为 `InboundRequest`，再进入 `UnifiedTurnRuntime`。入口层不做规则式意图分类；AgentTurnLoop 在同一回合中选择直接回答、查询任务状态、启动 Pilot 长任务，或显式调用 `run_decision_router_plan` 进入旧 DAG 调试路径。
 
 ### 7. Pilot 任务闭环是事件化的
 

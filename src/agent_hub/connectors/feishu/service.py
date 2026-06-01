@@ -29,9 +29,9 @@ from agent_hub.connectors.feishu.webhook import (
     FeishuWebhookProcessor,
     FeishuWebhookResult,
 )
+from agent_hub.contracts.turn import TurnIntent
 from agent_hub.pilot.domain.enums import TaskStatus
 from agent_hub.pilot.services.dto import TaskHandle
-from agent_hub.pilot.services.ingress import IngressIntent
 from agent_hub.pilot.skills.feishu_card import build_decision_card
 
 if TYPE_CHECKING:
@@ -53,7 +53,7 @@ class FeishuAckResult:
     reason: str | None = None
     ack_message_id: str | None = None
     approval_decision: dict[str, object] | None = None
-    intent: IngressIntent | None = None
+    intent: TurnIntent | None = None
     reply_message_id: str | None = None
     # 在 ``card.action.trigger`` 回调中需要同步返回给飞书客户端的
     # “决议后终态卡片”；为空时客户端会保留原卡片。
@@ -125,6 +125,7 @@ class FeishuWebhookService:
         plan_id: str | None = None
         task_status_str: str | None = None
         deduplicated: bool = False
+        turn_intent = TurnIntent.IGNORE
 
         try:
             async for chunk in self._turn_runtime.stream(inbound):
@@ -140,7 +141,19 @@ class FeishuWebhookService:
                     ack_id = await self._maybe_ack(message)
                 elif chunk_type in ("token", "final") and content:
                     reply_parts.append(str(content))
+                    if turn_intent is TurnIntent.IGNORE:
+                        turn_intent = TurnIntent.ORDINARY_QA
+                elif chunk_type == "blocked":
+                    if content:
+                        reply_parts.append(str(content))
+                    turn_intent = TurnIntent.BLOCKED
+                    break
+                elif chunk_type == "error":
+                    turn_intent = TurnIntent.ERROR
+                    logger.warning("feishu.service.turn_chunk_error", error=str(content))
                 elif chunk_type == "tool_finished":
+                    if chunk.get("tool_name") == "query_task_status":
+                        turn_intent = TurnIntent.PROGRESS_QUERY
                     tool_result = chunk.get("result")
                     if (
                         isinstance(tool_result, dict)
@@ -152,6 +165,7 @@ class FeishuWebhookService:
                         plan_id = tool_result.get("plan_id")
                         task_status_str = tool_result.get("task_status")
                         deduplicated = bool(tool_result.get("deduplicated", False))
+                        turn_intent = TurnIntent.START_TASK
         except Exception as exc:  # noqa: BLE001
             logger.warning("feishu.service.turn_failed", error=str(exc))
             return FeishuAckResult(
@@ -180,7 +194,7 @@ class FeishuWebhookService:
                 outcome=FeishuWebhookOutcome.ACCEPTED,
                 handle=task_handle,
                 ack_message_id=ack_id,
-                intent=IngressIntent.START_TASK,
+                intent=TurnIntent.START_TASK,
             )
 
         reply_text = "".join(reply_parts) or None
@@ -188,7 +202,11 @@ class FeishuWebhookService:
             reply_id = await self._send_text_reply(message, reply_text)
             return FeishuAckResult(
                 outcome=FeishuWebhookOutcome.ACCEPTED,
-                intent=IngressIntent.ORDINARY_QA,
+                intent=(
+                    turn_intent
+                    if turn_intent is not TurnIntent.IGNORE
+                    else TurnIntent.ORDINARY_QA
+                ),
                 reply_message_id=reply_id,
             )
 
@@ -398,7 +416,7 @@ class FeishuWebhookService:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "feishu.ingress.reply_failed",
+                "feishu.turn.reply_failed",
                 chat_id=message.chat_id,
                 error=str(exc),
             )
